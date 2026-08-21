@@ -7,6 +7,8 @@ from __future__ import annotations
 
 import argparse
 import collections
+import concurrent.futures
+import contextlib
 import hashlib
 import json
 import os
@@ -60,6 +62,29 @@ def resolve_input(args: argparse.Namespace) -> tuple[Path, dict[str, str]]:
         "requested_revision": args.hf_revision,
         "resolved_revision": snapshot.name,
     }
+
+
+class Progress:
+    def __init__(self, total: int) -> None:
+        self.done = 0
+        self.total = total
+        self.started = time.monotonic()
+        self.lock = threading.Lock()
+
+    def advance(self, count: int = 1, report: bool = True) -> None:
+        with self.lock:
+            previous_bucket = self.done // 100
+            self.done += count
+            if not report or self.done // 100 == previous_bucket:
+                return
+            elapsed = time.monotonic() - self.started
+            rate = self.done / elapsed
+            remaining = (self.total - self.done) / rate
+            print(
+                f"{self.done:,}/{self.total:,} "
+                f"({rate:.2f} positions/s, ETA {remaining / 3600:.2f} h)",
+                flush=True,
+            )
 
 
 class Lc0:
@@ -217,13 +242,49 @@ def output_is_valid(path: Path, rows: int, metadata: dict[bytes, bytes]) -> bool
     ).get(b"zero_wdl_complete") == b"true"
 
 
+def evaluate_positions(
+    fens: list[str], engines: list[Lc0], progress: Progress
+) -> list[tuple[int, int, int]]:
+    results: list[tuple[int, int, int] | None] = [None] * len(fens)
+    shards: list[list[tuple[int, str]]] = [[] for _ in engines]
+    for index, fen in enumerate(fens):
+        shards[index % len(engines)].append((index, fen))
+    stop = threading.Event()
+
+    def evaluate_shard(engine: Lc0, shard: list[tuple[int, str]]) -> None:
+        try:
+            for index, fen in shard:
+                if stop.is_set():
+                    return
+                results[index] = engine.evaluate(fen)
+                progress.advance()
+        except BaseException:
+            stop.set()
+            raise
+
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=len(engines))
+    futures = [
+        executor.submit(evaluate_shard, engine, shard)
+        for engine, shard in zip(engines, shards)
+    ]
+    try:
+        for future in concurrent.futures.as_completed(futures):
+            future.result()
+    finally:
+        stop.set()
+        executor.shutdown(wait=True, cancel_futures=True)
+    if any(result is None for result in results):
+        raise RuntimeError("accelerator workers returned an incomplete WDL batch")
+    return [result for result in results if result is not None]
+
+
 def label_file(
     source: Path,
     destination: Path,
     work: Path,
-    engine: Lc0,
+    engines: list[Lc0],
     provenance: dict[bytes, bytes],
-    progress: dict[str, float],
+    progress: Progress,
 ) -> None:
     source_hash = sha256(source)
     metadata = dict(pq.ParquetFile(source).schema_arrow.metadata or {})
@@ -235,7 +296,7 @@ def label_file(
     final_metadata = dict(metadata)
     final_metadata[b"zero_wdl_complete"] = b"true"
     if output_is_valid(destination, rows, final_metadata):
-        progress["done"] += rows
+        progress.advance(rows, report=False)
         print(f"skip complete {destination}: {rows:,} rows", flush=True)
         return
 
@@ -246,22 +307,10 @@ def label_file(
         chunk = work / f"row-group-{group:05d}.parquet"
         chunks.append(chunk)
         if chunk_is_valid(chunk, table.num_rows, metadata):
-            progress["done"] += table.num_rows
+            progress.advance(table.num_rows, report=False)
             continue
         fens = table.column("fen").to_pylist()
-        wdls: list[tuple[int, int, int]] = []
-        for fen in fens:
-            wdls.append(engine.evaluate(fen))
-            progress["done"] += 1
-            if int(progress["done"]) % 100 == 0:
-                elapsed = time.monotonic() - progress["started"]
-                rate = progress["done"] / elapsed
-                remaining = (progress["total"] - progress["done"]) / rate
-                print(
-                    f"{int(progress['done']):,}/{int(progress['total']):,} "
-                    f"({rate:.2f} positions/s, ETA {remaining / 3600:.2f} h)",
-                    flush=True,
-                )
+        wdls = evaluate_positions(fens, engines, progress)
         labeled = add_wdl(table, wdls, metadata)
         temporary = chunk.with_suffix(".tmp")
         pq.write_table(labeled, temporary, compression="zstd", compression_level=6)
@@ -310,10 +359,25 @@ def run(args: argparse.Namespace) -> None:
             raise RuntimeError(f"missing required file: {path}")
 
     total = sum(pq.ParquetFile(path).metadata.num_rows for path in files)
-    progress = {"done": 0.0, "total": float(total), "started": time.monotonic()}
+    workers = (
+        args.workers
+        if args.workers is not None
+        else (4 if args.backend == "cuda" else 1)
+    )
+    if workers < 1:
+        raise RuntimeError("--workers must be at least 1")
+    progress = Progress(total)
     binary_hash = sha256(binary)
     weights_hash = sha256(weights)
-    with Lc0(binary, weights, args.backend) as engine:
+    with contextlib.ExitStack() as stack:
+        engines = [
+            stack.enter_context(Lc0(binary, weights, args.backend))
+            for _ in range(workers)
+        ]
+        versions = {engine.version for engine in engines}
+        if len(versions) != 1:
+            raise RuntimeError(f"lc0 worker version mismatch: {sorted(versions)}")
+        engine_version = engines[0].version
         provenance = {
             b"zero_wdl_command": b"go depth 0",
             b"zero_wdl_perspective": b"side_to_move",
@@ -322,7 +386,7 @@ def run(args: argparse.Namespace) -> None:
                 b"python-chess outcome(claim_draw=True)"
             ),
             b"lc0_backend": args.backend.encode(),
-            b"lc0_version": engine.version.encode(),
+            b"lc0_version": engine_version.encode(),
             b"lc0_binary_sha256": binary_hash.encode(),
             b"lc0_weights_filename": weights.name.encode(),
             b"lc0_weights_sha256": weights_hash.encode(),
@@ -336,10 +400,11 @@ def run(args: argparse.Namespace) -> None:
             json.dumps(
                 {
                     "rows": total,
-                    "lc0_version": engine.version,
+                    "lc0_version": engine_version,
                     "lc0_binary_sha256": binary_hash,
                     "weights_sha256": weights_hash,
                     "backend": args.backend,
+                    "workers": workers,
                 },
                 indent=2,
             ),
@@ -349,7 +414,7 @@ def run(args: argparse.Namespace) -> None:
             relative = source.relative_to(source_root)
             destination = output_root / relative
             work = output_root / "_work" / relative.parent
-            label_file(source, destination, work, engine, provenance, progress)
+            label_file(source, destination, work, engines, provenance, progress)
 
     partitions = []
     output_total = 0
@@ -376,11 +441,12 @@ def run(args: argparse.Namespace) -> None:
         "wdl_scale": 1000,
         "wdl_perspective": "side_to_move",
         "terminal_adjudication": "python-chess outcome(claim_draw=True)",
-        "lc0_version": engine.version,
+        "lc0_version": engine_version,
         "lc0_binary_sha256": binary_hash,
         "lc0_weights_filename": weights.name,
         "lc0_weights_sha256": weights_hash,
         "backend": args.backend,
+        "workers": workers,
         "source": source_details,
         "partitions": partitions,
     }
@@ -412,6 +478,11 @@ def main() -> None:
         required=True,
         choices=("cuda", "metal"),
         help="hardware accelerator; CPU backends are intentionally unsupported",
+    )
+    parser.add_argument(
+        "--workers",
+        type=int,
+        help="persistent lc0 processes (default: cuda=4, metal=1)",
     )
     try:
         run(parser.parse_args())

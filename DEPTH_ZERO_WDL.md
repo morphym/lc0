@@ -186,6 +186,12 @@ only the Parquet data through the Hugging Face cache and records the resolved
 Hub commit in the output metadata. `--hf-dataset` and local `--input` are
 mutually exclusive. Only `metal` and `cuda` backends are accepted.
 
+CUDA defaults to four persistent lc0 worker processes so independent root
+evaluations can overlap and keep throughput-oriented GPUs occupied. Metal
+defaults to one. Override either default with `--workers`; on CUDA, try 2, 4,
+and 8 and retain the fastest setting that fits GPU memory. Worker-count changes
+do not invalidate completed row-group checkpoints.
+
 ## Verified latency
 
 Test system:
