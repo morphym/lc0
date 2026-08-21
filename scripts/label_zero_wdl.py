@@ -35,6 +35,33 @@ def sha256(path: Path) -> str:
     return digest.hexdigest()
 
 
+def resolve_input(args: argparse.Namespace) -> tuple[Path, dict[str, str]]:
+    if args.input:
+        source = Path(args.input).resolve()
+        return source, {"type": "local", "path": str(source)}
+    try:
+        from huggingface_hub import snapshot_download
+    except ImportError as exc:
+        raise RuntimeError(
+            "--hf-dataset requires huggingface_hub; install huggingface_hub"
+        ) from exc
+    snapshot = Path(
+        snapshot_download(
+            repo_id=args.hf_dataset,
+            repo_type="dataset",
+            revision=args.hf_revision,
+            allow_patterns=("data/**/*.parquet", "data/_manifest.json"),
+        )
+    )
+    source = snapshot / "data"
+    return source, {
+        "type": "huggingface",
+        "dataset": args.hf_dataset,
+        "requested_revision": args.hf_revision,
+        "resolved_revision": snapshot.name,
+    }
+
+
 class Lc0:
     def __init__(self, binary: Path, weights: Path, backend: str) -> None:
         self.binary = binary.resolve()
@@ -269,7 +296,7 @@ def label_file(
 
 
 def run(args: argparse.Namespace) -> None:
-    source_root = Path(args.input).resolve()
+    source_root, source_details = resolve_input(args)
     output_root = Path(args.output).resolve()
     binary = Path(args.lc0).resolve()
     weights = Path(args.weights).resolve()
@@ -300,6 +327,11 @@ def run(args: argparse.Namespace) -> None:
             b"lc0_weights_filename": weights.name.encode(),
             b"lc0_weights_sha256": weights_hash.encode(),
         }
+        if source_details["type"] == "huggingface":
+            provenance[b"source_hf_dataset"] = source_details["dataset"].encode()
+            provenance[b"source_hf_revision"] = source_details[
+                "resolved_revision"
+            ].encode()
         print(
             json.dumps(
                 {
@@ -349,6 +381,7 @@ def run(args: argparse.Namespace) -> None:
         "lc0_weights_filename": weights.name,
         "lc0_weights_sha256": weights_hash,
         "backend": args.backend,
+        "source": source_details,
         "partitions": partitions,
     }
     output_root.mkdir(parents=True, exist_ok=True)
@@ -360,7 +393,17 @@ def run(args: argparse.Namespace) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input", required=True, help="unlabeled Parquet dataset directory")
+    source = parser.add_mutually_exclusive_group(required=True)
+    source.add_argument("--input", help="local unlabeled Parquet dataset directory")
+    source.add_argument(
+        "--hf-dataset",
+        help="Hugging Face dataset repository, for example Pawitt/zero-evaluator",
+    )
+    parser.add_argument(
+        "--hf-revision",
+        default="main",
+        help="Hugging Face branch, tag, or commit (default: main)",
+    )
     parser.add_argument("--output", required=True, help="labeled Parquet dataset directory")
     parser.add_argument("--lc0", required=True, help="custom zero-wdl lc0 binary")
     parser.add_argument("--weights", required=True, help="lc0 network weights")
