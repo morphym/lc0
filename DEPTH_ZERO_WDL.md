@@ -162,6 +162,30 @@ from the preceding `info depth 0` line.
 For a long-running labeling process, keep one lc0 process alive. Reusing the
 process avoids network loading and Metal graph-compilation overhead.
 
+## Label the published Hugging Face dataset
+
+Install the labeler's Python dependencies:
+
+```bash
+python3 -m pip install python-chess pyarrow huggingface-hub
+```
+
+Then stream the published Parquet snapshot through the persistent lc0 process:
+
+```bash
+python3 scripts/label_zero_wdl.py \
+  --hf-dataset Pawitt/zero-evaluator \
+  --output zero-evaluator-wdl.parquet \
+  --lc0 build/release/lc0 \
+  --weights build/release/BT4-it332.pb.gz \
+  --backend metal
+```
+
+`--hf-revision` optionally pins a branch, tag, or commit. The script downloads
+only the Parquet data through the Hugging Face cache and records the resolved
+Hub commit in the output metadata. `--hf-dataset` and local `--input` are
+mutually exclusive. Only `metal` and `cuda` backends are accepted.
+
 ## Verified latency
 
 Test system:
