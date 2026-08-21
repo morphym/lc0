@@ -190,7 +190,13 @@ CUDA defaults to four persistent lc0 worker processes so independent root
 evaluations can overlap and keep throughput-oriented GPUs occupied. Metal
 defaults to one. Override either default with `--workers`; on CUDA, try 2, 4,
 and 8 and retain the fastest setting that fits GPU memory. Worker-count changes
-do not invalidate completed row-group checkpoints.
+do not invalidate completed checkpoints.
+
+Progress is atomically checkpointed every 1,000 positions under the output
+dataset's `_work/` directory. Restart the identical command to resume; at most
+the currently active 1,000-position block is repeated. Use
+`--checkpoint-rows` to trade checkpoint frequency against small-file overhead.
+Final partition files are still assembled with 65,536-row groups.
 
 ## Verified latency
 

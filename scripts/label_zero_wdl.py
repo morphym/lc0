@@ -67,6 +67,7 @@ def resolve_input(args: argparse.Namespace) -> tuple[Path, dict[str, str]]:
 class Progress:
     def __init__(self, total: int) -> None:
         self.done = 0
+        self.run_done = 0
         self.total = total
         self.started = time.monotonic()
         self.lock = threading.Lock()
@@ -75,10 +76,12 @@ class Progress:
         with self.lock:
             previous_bucket = self.done // 100
             self.done += count
+            if report:
+                self.run_done += count
             if not report or self.done // 100 == previous_bucket:
                 return
             elapsed = time.monotonic() - self.started
-            rate = self.done / elapsed
+            rate = self.run_done / elapsed
             remaining = (self.total - self.done) / rate
             print(
                 f"{self.done:,}/{self.total:,} "
@@ -285,6 +288,7 @@ def label_file(
     engines: list[Lc0],
     provenance: dict[bytes, bytes],
     progress: Progress,
+    checkpoint_rows: int,
 ) -> None:
     source_hash = sha256(source)
     metadata = dict(pq.ParquetFile(source).schema_arrow.metadata or {})
@@ -304,21 +308,32 @@ def label_file(
     chunks: list[Path] = []
     for group in range(parquet.num_row_groups):
         table = parquet.read_row_group(group)
-        chunk = work / f"row-group-{group:05d}.parquet"
-        chunks.append(chunk)
-        if chunk_is_valid(chunk, table.num_rows, metadata):
+        legacy_chunk = work / f"row-group-{group:05d}.parquet"
+        if chunk_is_valid(legacy_chunk, table.num_rows, metadata):
+            chunks.append(legacy_chunk)
             progress.advance(table.num_rows, report=False)
             continue
-        fens = table.column("fen").to_pylist()
-        wdls = evaluate_positions(fens, engines, progress)
-        labeled = add_wdl(table, wdls, metadata)
-        temporary = chunk.with_suffix(".tmp")
-        pq.write_table(labeled, temporary, compression="zstd", compression_level=6)
-        os.replace(temporary, chunk)
+        for part, offset in enumerate(range(0, table.num_rows, checkpoint_rows)):
+            source_part = table.slice(offset, checkpoint_rows)
+            chunk = work / f"row-group-{group:05d}-part-{part:05d}.parquet"
+            chunks.append(chunk)
+            if chunk_is_valid(chunk, source_part.num_rows, metadata):
+                progress.advance(source_part.num_rows, report=False)
+                continue
+            fens = source_part.column("fen").to_pylist()
+            wdls = evaluate_positions(fens, engines, progress)
+            labeled = add_wdl(source_part, wdls, metadata)
+            temporary = chunk.with_suffix(".tmp")
+            pq.write_table(
+                labeled, temporary, compression="zstd", compression_level=6
+            )
+            os.replace(temporary, chunk)
 
     destination.parent.mkdir(parents=True, exist_ok=True)
     temporary = destination.with_suffix(".tmp")
     writer: pq.ParquetWriter | None = None
+    buffered: list[pa.Table] = []
+    buffered_rows = 0
     try:
         for chunk in chunks:
             table = pq.read_table(chunk).replace_schema_metadata(final_metadata)
@@ -330,9 +345,19 @@ def label_file(
                     compression_level=6,
                     write_statistics=True,
                 )
-            writer.write_table(table, row_group_size=table.num_rows)
+            buffered.append(table)
+            buffered_rows += table.num_rows
+            if buffered_rows >= 65_536:
+                combined = pa.concat_tables(buffered)
+                writer.write_table(combined.slice(0, 65_536), row_group_size=65_536)
+                remainder = combined.slice(65_536)
+                buffered = [remainder] if remainder.num_rows else []
+                buffered_rows = remainder.num_rows
         if writer is None:
             raise RuntimeError(f"source has no row groups: {source}")
+        if buffered:
+            combined = pa.concat_tables(buffered)
+            writer.write_table(combined, row_group_size=65_536)
         writer.close()
         writer = None
         os.replace(temporary, destination)
@@ -414,7 +439,15 @@ def run(args: argparse.Namespace) -> None:
             relative = source.relative_to(source_root)
             destination = output_root / relative
             work = output_root / "_work" / relative.parent
-            label_file(source, destination, work, engines, provenance, progress)
+            label_file(
+                source,
+                destination,
+                work,
+                engines,
+                provenance,
+                progress,
+                args.checkpoint_rows,
+            )
 
     partitions = []
     output_total = 0
@@ -484,8 +517,17 @@ def main() -> None:
         type=int,
         help="persistent lc0 processes (default: cuda=4, metal=1)",
     )
+    parser.add_argument(
+        "--checkpoint-rows",
+        type=int,
+        default=1000,
+        help="positions per atomic resume checkpoint (default: 1000)",
+    )
     try:
-        run(parser.parse_args())
+        args = parser.parse_args()
+        if args.checkpoint_rows < 1:
+            parser.error("--checkpoint-rows must be at least 1")
+        run(args)
     except (KeyboardInterrupt, BrokenPipeError):
         print("interrupted; completed row-group checkpoints are retained", file=sys.stderr)
         raise SystemExit(130)
