@@ -17,6 +17,7 @@ import threading
 import time
 from pathlib import Path
 
+import chess
 import pyarrow as pa
 import pyarrow.parquet as pq
 
@@ -111,6 +112,18 @@ class Lc0:
         return names[0]
 
     def evaluate(self, fen: str) -> tuple[int, int, int]:
+        board = chess.Board(fen)
+        if not board.is_valid():
+            raise RuntimeError(f"invalid chess position: {fen!r}")
+        outcome = board.outcome(claim_draw=True)
+        if outcome is not None:
+            if outcome.winner is None:
+                return (0, 1000, 0)
+            return (
+                (1000, 0, 0)
+                if outcome.winner == board.turn
+                else (0, 0, 1000)
+            )
         self._send("position fen " + fen)
         self._send("go depth 0")
         lines = self._read_until("bestmove")
@@ -278,6 +291,9 @@ def run(args: argparse.Namespace) -> None:
             b"zero_wdl_command": b"go depth 0",
             b"zero_wdl_perspective": b"side_to_move",
             b"zero_wdl_scale": b"1000",
+            b"zero_wdl_terminal_adjudication": (
+                b"python-chess outcome(claim_draw=True)"
+            ),
             b"lc0_backend": args.backend.encode(),
             b"lc0_version": engine.version.encode(),
             b"lc0_binary_sha256": binary_hash.encode(),
@@ -327,6 +343,7 @@ def run(args: argparse.Namespace) -> None:
         "wdl_columns": list(WDL_COLUMNS),
         "wdl_scale": 1000,
         "wdl_perspective": "side_to_move",
+        "terminal_adjudication": "python-chess outcome(claim_draw=True)",
         "lc0_version": engine.version,
         "lc0_binary_sha256": binary_hash,
         "lc0_weights_filename": weights.name,
