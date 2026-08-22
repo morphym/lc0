@@ -26,6 +26,7 @@ import pyarrow.parquet as pq
 
 
 SCHEMA_VERSION = 1
+RESUME_SCHEMA_VERSION = 1
 SPLITS = ("train", "validation", "test")
 MOVE_STATS_RE = re.compile(
     r"^info string (?P<move>[a-h][1-8][a-h][1-8][qrbn]?)\s+"
@@ -35,6 +36,7 @@ MOVE_STATS_RE = re.compile(
     r"\(V:\s*(?P<v>-?[0-9.]+|-\.-+)\)"
 )
 WDL_RE = re.compile(r"\bwdl (\d+) (\d+) (\d+)\b")
+CHECKPOINT_RE = re.compile(r"^rows-(\d{9})-(\d{9})\.parquet$")
 CASTLING_UCI = {
     "e1h1": "e1g1",
     "e1a1": "e1c1",
@@ -107,25 +109,127 @@ def git_identity(binary: Path) -> str:
 
 
 class Progress:
-    def __init__(self, total: int) -> None:
-        self.done = 0
+    def __init__(self, total: int, done: int = 0) -> None:
+        self.done = done
         self.run_done = 0
         self.total = total
         self.started = time.monotonic()
+
+    @property
+    def rate(self) -> float:
+        elapsed = time.monotonic() - self.started
+        return self.run_done / elapsed if elapsed > 0 else 0.0
+
+    def set_total(self, total: int) -> None:
+        self.total = total
 
     def advance(self, count: int, resumed: bool = False) -> None:
         self.done += count
         if resumed:
             return
         self.run_done += count
-        elapsed = time.monotonic() - self.started
-        rate = self.run_done / elapsed
+        rate = self.rate
         remaining = (self.total - self.done) / rate
         print(
             f"{self.done:,}/{self.total:,} "
             f"({rate:.3f} positions/s, ETA {remaining / 3600:.2f} h)",
             flush=True,
         )
+
+
+def apportion(total: int, counts: dict[str, int]) -> dict[str, int]:
+    denominator = sum(counts.values())
+    raw = {key: total * value / denominator for key, value in counts.items()}
+    result = {key: math.floor(value) for key, value in raw.items()}
+    missing = total - sum(result.values())
+    order = sorted(counts, key=lambda key: (raw[key] - result[key], key), reverse=True)
+    for key in order[:missing]:
+        result[key] += 1
+    return result
+
+
+def write_json_atomic(path: Path, value: dict[str, object]) -> None:
+    path.parent.mkdir(parents=True, exist_ok=True)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    temporary.write_text(json.dumps(value, indent=2, sort_keys=True) + "\n")
+    os.replace(temporary, path)
+
+
+def checkpoint_path(
+    output: Path, split: str, offset: int, rows: int
+) -> Path:
+    return (
+        output
+        / "_work"
+        / split
+        / f"rows-{offset:09d}-{offset + rows:09d}.parquet"
+    )
+
+
+def checkpoint_bounds(path: Path) -> tuple[int, int]:
+    match = CHECKPOINT_RE.match(path.name)
+    if not match:
+        raise RuntimeError(f"invalid checkpoint filename: {path}")
+    return int(match.group(1)), int(match.group(2))
+
+
+def scan_checkpoints(
+    tables: dict[str, pa.Table],
+    output: Path,
+    checkpoint_rows: int,
+    provenance: dict[bytes, bytes],
+    limits: dict[str, int],
+) -> dict[str, dict[int, Path]]:
+    found: dict[str, dict[int, Path]] = {split: {} for split in SPLITS}
+    for split, table in tables.items():
+        for offset in range(0, limits[split], checkpoint_rows):
+            rows = min(checkpoint_rows, limits[split] - offset)
+            path = checkpoint_path(output, split, offset, rows)
+            if checkpoint_valid(path, rows, provenance):
+                found[split][offset] = path
+    return found
+
+
+def refresh_resume_state(
+    state: dict[str, object],
+    completed: dict[str, dict[int, Path]],
+    tables: dict[str, pa.Table],
+    limits: dict[str, int],
+) -> None:
+    ranges: dict[str, list[dict[str, object]]] = {}
+    completed_rows = 0
+    for split in SPLITS:
+        items = []
+        for offset, path in sorted(completed[split].items()):
+            start, end = checkpoint_bounds(path)
+            if start != offset:
+                raise RuntimeError(f"checkpoint offset mismatch: {path}")
+            if start >= limits[split] or end > limits[split]:
+                continue
+            items.append({"start": start, "end": end, "file": str(path)})
+            completed_rows += end - start
+        ranges[split] = items
+    state["completed_ranges"] = ranges
+    state["completed_rows"] = completed_rows
+
+    next_position: dict[str, object] | None = None
+    for split in SPLITS:
+        end = 0
+        for item in ranges[split]:
+            if int(item["start"]) != end:
+                break
+            end = int(item["end"])
+        if end < limits[split]:
+            row = tables[split].slice(end, 1).to_pylist()[0]
+            next_position = {
+                "split": split,
+                "split_offset": end,
+                "source_game_id": row["source_game_id"],
+                "source_ply": row["source_ply"],
+                "fen": row["fen"],
+            }
+            break
+    state["next_position"] = next_position
 
 
 class Lc0PolicyEngine:
@@ -479,7 +583,10 @@ def run(args: argparse.Namespace) -> None:
     binary_hash = sha256(binary)
     weights_hash = sha256(weights)
     commit = args.lc0_commit or git_identity(binary)
-    progress = Progress(plan.num_rows)
+    split_tables = {
+        split: plan.filter(pc.equal(plan["split"], split)) for split in SPLITS
+    }
+    split_sizes = {split: table.num_rows for split, table in split_tables.items()}
 
     with Lc0PolicyEngine(
         binary, weights, args.backend, args.nncache_size, args.minibatch_size
@@ -502,15 +609,91 @@ def run(args: argparse.Namespace) -> None:
             b"q_perspective": b"side_to_move",
             b"input_plan_sha256": plan_hash.encode(),
         }
+        resume_path = output / "resumability.metadata.json"
+        adaptive_enabled = args.adaptive_stop_hours is not None
+        resume_config = {
+            "backend": args.backend,
+            "nodes": args.nodes,
+            "minibatch_size": args.minibatch_size,
+            "checkpoint_rows": args.checkpoint_rows,
+            "adaptive_stop_hours": args.adaptive_stop_hours,
+            "adaptive_safety_factor": args.adaptive_safety_factor,
+            "adaptive_warmup_rows": args.adaptive_warmup_rows,
+        }
+        provenance_json = {
+            key.decode(): value.decode() for key, value in provenance.items()
+        }
+        existing_work = (output / "_work").exists() and any(
+            (output / "_work").rglob("*.parquet")
+        )
+        if (resume_path.exists() or existing_work) and not args.resume:
+            raise RuntimeError(
+                f"existing run state found under {output}; pass --resume to continue "
+                "it or choose a new --output"
+            )
+        if resume_path.exists():
+            state = json.loads(resume_path.read_text())
+            if state.get("schema_version") != RESUME_SCHEMA_VERSION:
+                raise RuntimeError("unsupported resumability metadata schema")
+            if state.get("input_plan_sha256") != plan_hash:
+                raise RuntimeError("resume input plan hash does not match")
+            if state.get("config") != resume_config:
+                raise RuntimeError("resume settings do not match the existing run")
+            if state.get("provenance") != provenance_json:
+                raise RuntimeError("resume engine or network provenance does not match")
+        else:
+            state = {
+                "schema_version": RESUME_SCHEMA_VERSION,
+                "status": "running",
+                "input_plan": str(plan_path),
+                "input_plan_sha256": plan_hash,
+                "plan_rows": plan.num_rows,
+                "split_plan_rows": split_sizes,
+                "config": resume_config,
+                "provenance": provenance_json,
+                "adaptive": {
+                    "enabled": adaptive_enabled,
+                    "measured_positions_per_second": None,
+                    "target_rows": None if adaptive_enabled else plan.num_rows,
+                    "target_rows_by_split": None,
+                },
+                "completed_ranges": {split: [] for split in SPLITS},
+                "completed_rows": 0,
+                "next_position": None,
+            }
+
+        adaptive = state["adaptive"]
+        target_rows_value = adaptive.get("target_rows")
+        target_rows = int(target_rows_value) if target_rows_value is not None else None
+        limits = (
+            apportion(target_rows, split_sizes)
+            if target_rows is not None
+            else dict(split_sizes)
+        )
+        completed = scan_checkpoints(
+            split_tables, output, args.checkpoint_rows, provenance, limits
+        )
+        resume_base_rows = sum(
+            checkpoint_bounds(path)[1] - checkpoint_bounds(path)[0]
+            for paths in completed.values()
+            for path in paths.values()
+        )
+        progress = Progress(target_rows or plan.num_rows, done=resume_base_rows)
+        refresh_resume_state(state, completed, split_tables, limits)
+        write_json_atomic(resume_path, state)
         print(
             json.dumps(
                 {
-                    "rows": plan.num_rows,
+                    "rows": target_rows or plan.num_rows,
+                    "plan_rows": plan.num_rows,
                     "lc0_version": engine.version,
                     "lc0_commit": commit,
                     "network_sha256": weights_hash,
                     "backend": args.backend,
                     "nodes_per_position": args.nodes,
+                    "minibatch_size": args.minibatch_size,
+                    "adaptive_stop_hours": args.adaptive_stop_hours,
+                    "resumed_rows": resume_base_rows,
                 },
                 indent=2,
             ),
@@ -518,30 +701,80 @@ def run(args: argparse.Namespace) -> None:
         )
         chunks_by_split: dict[str, list[Path]] = {split: [] for split in SPLITS}
         for split in SPLITS:
-            split_table = plan.filter(pc.equal(plan["split"], split))
-            for offset in range(0, split_table.num_rows, args.checkpoint_rows):
-                source = split_table.slice(offset, args.checkpoint_rows)
-                checkpoint = (
-                    output
-                    / "_work"
-                    / split
-                    / f"rows-{offset:09d}-{offset + source.num_rows:09d}.parquet"
+            split_table = split_tables[split]
+            offset = 0
+            while offset < limits[split]:
+                source = split_table.slice(
+                    offset, min(args.checkpoint_rows, limits[split] - offset)
                 )
+                checkpoint = checkpoint_path(output, split, offset, source.num_rows)
                 chunks_by_split[split].append(checkpoint)
-                if checkpoint_valid(checkpoint, source.num_rows, provenance):
-                    progress.advance(source.num_rows, resumed=True)
-                    continue
-                labeled = evaluate_chunk(source, engine, args.nodes, args.retries)
-                checkpoint.parent.mkdir(parents=True, exist_ok=True)
-                temporary = checkpoint.with_suffix(".tmp")
-                pq.write_table(
-                    labeled.replace_schema_metadata(provenance),
-                    temporary,
-                    compression="zstd",
-                    compression_level=6,
-                )
-                os.replace(temporary, checkpoint)
-                progress.advance(source.num_rows)
+                existing = completed[split].get(offset)
+                if existing is not None and checkpoint_valid(
+                    existing, source.num_rows, provenance
+                ):
+                    checkpoint = existing
+                    chunks_by_split[split][-1] = checkpoint
+                else:
+                    labeled = evaluate_chunk(source, engine, args.nodes, args.retries)
+                    checkpoint.parent.mkdir(parents=True, exist_ok=True)
+                    temporary = checkpoint.with_suffix(".tmp")
+                    pq.write_table(
+                        labeled.replace_schema_metadata(provenance),
+                        temporary,
+                        compression="zstd",
+                        compression_level=6,
+                    )
+                    os.replace(temporary, checkpoint)
+                    completed[split][offset] = checkpoint
+                    progress.advance(source.num_rows)
+
+                    if (
+                        adaptive_enabled
+                        and target_rows is None
+                        and progress.run_done >= args.adaptive_warmup_rows
+                    ):
+                        capacity = math.floor(
+                            progress.rate
+                            * args.adaptive_stop_hours
+                            * 3600
+                            * args.adaptive_safety_factor
+                        )
+                        target_rows = min(
+                            plan.num_rows,
+                            max(progress.done, resume_base_rows + capacity),
+                        )
+                        limits = apportion(target_rows, split_sizes)
+                        if limits[split] < offset + source.num_rows:
+                            limits[split] = offset + source.num_rows
+                            target_rows = sum(limits.values())
+                        progress.set_total(target_rows)
+                        adaptive["measured_positions_per_second"] = progress.rate
+                        adaptive["target_rows"] = target_rows
+                        adaptive["target_rows_by_split"] = limits
+                        adaptive["warmup_new_rows"] = progress.run_done
+                        adaptive["estimated_search_hours"] = (
+                            (target_rows - resume_base_rows) / progress.rate / 3600
+                        )
+                        print(
+                            f"adaptive target frozen: {target_rows:,} rows at "
+                            f"{progress.rate:.3f} positions/s "
+                            f"({adaptive['estimated_search_hours']:.2f} h)",
+                            flush=True,
+                        )
+
+                refresh_resume_state(state, completed, split_tables, limits)
+                write_json_atomic(resume_path, state)
+                offset += source.num_rows
+
+        if adaptive_enabled and target_rows is None:
+            target_rows = progress.done
+            limits = apportion(target_rows, split_sizes)
+            adaptive["target_rows"] = target_rows
+            adaptive["target_rows_by_split"] = limits
+        state["status"] = "finalizing"
+        refresh_resume_state(state, completed, split_tables, limits)
+        write_json_atomic(resume_path, state)
 
         final_metadata = dict(provenance)
         final_metadata[b"generation_complete"] = b"true"
@@ -571,8 +804,9 @@ def run(args: argparse.Namespace) -> None:
                 "sha256": sha256(path),
             }
         )
-    if total_rows != plan.num_rows:
-        raise RuntimeError(f"final row mismatch: {total_rows} != {plan.num_rows}")
+    expected_rows = target_rows or plan.num_rows
+    if total_rows != expected_rows:
+        raise RuntimeError(f"final row mismatch: {total_rows} != {expected_rows}")
     manifest = {
         "schema_version": SCHEMA_VERSION,
         "rows": total_rows,
@@ -594,12 +828,17 @@ def run(args: argparse.Namespace) -> None:
         "source": args.source_description,
         "split_unit": "source_game_id",
         "input_plan_sha256": plan_hash,
+        "adaptive": state["adaptive"],
+        "resumability_metadata": resume_path.name,
         "partitions": partitions,
     }
     output.mkdir(parents=True, exist_ok=True)
     temporary = output / "manifest.tmp"
     temporary.write_text(json.dumps(manifest, indent=2, sort_keys=True) + "\n")
     os.replace(temporary, output / "manifest.json")
+    state["status"] = "complete"
+    state["next_position"] = None
+    write_json_atomic(resume_path, state)
     print(f"complete: {total_rows:,} rows", flush=True)
 
 
@@ -622,6 +861,24 @@ def main() -> None:
         ),
     )
     parser.add_argument("--retries", type=int, default=1)
+    parser.add_argument(
+        "--adaptive-stop-hours",
+        type=float,
+        help="measure throughput, then cap output rows to this runtime budget",
+    )
+    parser.add_argument(
+        "--adaptive-warmup-rows", type=int, default=100,
+        help="newly evaluated rows used for adaptive throughput measurement",
+    )
+    parser.add_argument(
+        "--adaptive-safety-factor", type=float, default=0.95,
+        help="fraction of the runtime budget assigned to searches",
+    )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="resume the run recorded by resumability.metadata.json",
+    )
     parser.add_argument("--lc0-commit", help="override auto-detected lc0 commit")
     parser.add_argument(
         "--source-description",
@@ -636,6 +893,12 @@ def main() -> None:
         parser.error("--minibatch-size cannot be negative")
     if args.retries < 0:
         parser.error("--retries cannot be negative")
+    if args.adaptive_stop_hours is not None and args.adaptive_stop_hours <= 0:
+        parser.error("--adaptive-stop-hours must be positive")
+    if args.adaptive_warmup_rows < 1:
+        parser.error("--adaptive-warmup-rows must be positive")
+    if not 0 < args.adaptive_safety_factor <= 1:
+        parser.error("--adaptive-safety-factor must be in (0, 1]")
     try:
         run(args)
     except (KeyboardInterrupt, BrokenPipeError):
