@@ -486,7 +486,7 @@ std::vector<std::string> Search::GetVerboseStats(const Node* node) const {
     *oss << std::right;
     print(oss, "N: ", n, " ", 7);
     print(oss, "(+", f, ") ", 2);
-    print(oss, "(P: ", p * 100, "%) ", 5, p >= 0.99995f ? 1 : 2);
+    print(oss, "(P: ", p * 100, "%) ", 12, 8);
   };
   auto print_stats = [&](auto* oss, const auto* n) {
     const auto sign = n == node ? -1 : 1;
@@ -503,13 +503,13 @@ std::vector<std::string> Search::GetVerboseStats(const Node* node) const {
               ? 0
               : params_.GetWDLRescaleDiff() * params_.GetWDLEvalObjectivity(),
           is_perspective, true, params_.GetWDLMaxS());
-      print(oss, "(WL: ", wl, ") ", 8, 5);
-      print(oss, "(D: ", d, ") ", 5, 3);
+      print(oss, "(WL: ", wl, ") ", 12, 8);
+      print(oss, "(D: ", d, ") ", 10, 8);
       print(oss, "(M: ", n->GetM(), ") ", 4, 1);
-      print(oss, "(Q: ", wl + draw_score * d, ") ", 8, 5);
+      print(oss, "(Q: ", wl + draw_score * d, ") ", 12, 8);
     } else {
       *oss << "(WL:  -.-----) (D: -.---) (M:  -.-) ";
-      print(oss, "(Q: ", fpu, ") ", 8, 5);
+      print(oss, "(Q: ", fpu, ") ", 12, 8);
     }
   };
   auto print_tail = [&](auto* oss, const auto* n) {
@@ -524,7 +524,7 @@ std::vector<std::string> Search::GetVerboseStats(const Node* node) const {
       if (nneval) v = -nneval->q;
     }
     if (v) {
-      print(oss, "(V: ", sign * *v, ") ", 7, 4);
+      print(oss, "(V: ", sign * *v, ") ", 12, 8);
     } else {
       *oss << "(V:  -.----) ";
     }
