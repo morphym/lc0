@@ -176,15 +176,48 @@ Then stream the published Parquet snapshot through the persistent lc0 process:
 python3 scripts/label_zero_wdl.py \
   --hf-dataset Pawitt/zero-evaluator \
   --output zero-evaluator-wdl.parquet \
-  --lc0 build/release/lc0 \
+  --engine-kind lc0 \
+  --engine build/release/lc0 \
   --weights build/release/BT4-it332.pb.gz \
   --backend metal
 ```
 
+`--lc0` remains an alias for `--engine`. A patched Stockfish binary can label
+the same dataset without accelerator arguments:
+
+```bash
+python3 scripts/label_zero_wdl.py \
+  --hf-dataset Pawitt/zero-evaluator \
+  --output zero-evaluator-stockfish-wdl.parquet \
+  --engine-kind stockfish \
+  --engine ../stockfish/src/stockfish
+```
+
+For another UCI-compatible depth-zero WDL producer, record its identity
+manually when needed:
+
+```bash
+python3 scripts/label_zero_wdl.py \
+  --input data/ccrl-high-variance-1p5m.parquet \
+  --output data/manual-zero-wdl.parquet \
+  --engine-kind uci \
+  --engine /path/to/engine \
+  --engine-name MyTeacher \
+  --engine-version experiment-7 \
+  --engine-weights network-42
+```
+
+Every output row contains `wdl_win`, `wdl_draw`, `wdl_loss`, plus
+`wdl_engine_name`, `wdl_engine_version`, and `wdl_engine_weights`. Parquet
+metadata and `_manifest.json` additionally record the binary SHA-256, backend,
+and weights checksum where applicable.
+
 `--hf-revision` optionally pins a branch, tag, or commit. The script downloads
 only the Parquet data through the Hugging Face cache and records the resolved
 Hub commit in the output metadata. `--hf-dataset` and local `--input` are
-mutually exclusive. Only `metal` and `cuda` backends are accepted.
+mutually exclusive. lc0 accepts only `metal` and `cuda`; Stockfish and generic
+UCI engines do not accept `--backend`. `--uci-option NAME=VALUE` can be
+repeated for additional engine settings.
 
 CUDA defaults to four persistent lc0 worker processes so independent root
 evaluations can overlap and keep throughput-oriented GPUs occupied. Metal
