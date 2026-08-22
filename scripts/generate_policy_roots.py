@@ -135,10 +135,12 @@ class Lc0PolicyEngine:
         weights: Path,
         backend: str,
         cache_size: int,
+        minibatch_size: int,
     ) -> None:
         self.binary = binary.resolve()
         self.weights = weights.resolve()
         self.backend = backend
+        self.minibatch_size = minibatch_size
         self.stderr_lines: collections.deque[str] = collections.deque(maxlen=200)
         self.backend_ready = threading.Event()
         self.backend_verified = False
@@ -148,7 +150,7 @@ class Lc0PolicyEngine:
                 str(self.binary),
                 f"--weights={self.weights}",
                 f"--backend={backend}",
-                "--minibatch-size=1",
+                f"--minibatch-size={minibatch_size}",
                 f"--nncache={cache_size}",
             ],
             stdin=subprocess.PIPE,
@@ -231,7 +233,7 @@ class Lc0PolicyEngine:
         self._send("position fen " + fen)
         self._send(f"go nodes {nodes}")
         lines = self._read_until("bestmove")
-        result = parse_search(lines, fen, legal_moves, nodes)
+        result = parse_search(lines, fen, legal_moves, nodes, self.minibatch_size)
         if not self.backend_verified:
             self.require_accelerator()
         return result
@@ -261,7 +263,8 @@ class Lc0PolicyEngine:
 
 
 def parse_search(
-    lines: list[str], fen: str, legal_moves: set[str], requested_nodes: int
+    lines: list[str], fen: str, legal_moves: set[str], requested_nodes: int,
+    minibatch_size: int,
 ) -> dict[str, object]:
     edges: dict[str, tuple[int, float, float, float | None]] = {}
     latest_wdl: tuple[int, int, int] | None = None
@@ -312,7 +315,12 @@ def parse_search(
     # legitimately be below one (substantially so in unusual positions).
     if not math.isfinite(prior_sum) or not 0.0 < prior_sum <= 1.001:
         raise RuntimeError(f"invalid raw root prior sum {prior_sum:.9f} for {fen!r}")
-    if sum(visits) > requested_nodes + 8:
+    # Searches stop with an NN batch in flight, so batched inference may exceed
+    # the requested node count by approximately one minibatch.
+    allowed_overshoot = (
+        requested_nodes if minibatch_size == 0 else max(8, minibatch_size)
+    )
+    if sum(visits) > requested_nodes + allowed_overshoot:
         raise RuntimeError(
             f"root visits {sum(visits)} exceed requested nodes {requested_nodes} for {fen!r}"
         )
@@ -474,7 +482,7 @@ def run(args: argparse.Namespace) -> None:
     progress = Progress(plan.num_rows)
 
     with Lc0PolicyEngine(
-        binary, weights, args.backend, args.nncache_size
+        binary, weights, args.backend, args.nncache_size, args.minibatch_size
     ) as engine:
         provenance = {
             b"schema_version": str(SCHEMA_VERSION).encode(),
@@ -488,6 +496,7 @@ def run(args: argparse.Namespace) -> None:
             b"smart_pruning_factor": b"0",
             b"dirichlet_noise": b"false",
             b"threads": b"1",
+            b"minibatch_size": str(args.minibatch_size).encode(),
             b"wdl_perspective": b"side_to_move",
             b"wdl_scale": b"1000",
             b"q_perspective": b"side_to_move",
@@ -577,6 +586,7 @@ def run(args: argparse.Namespace) -> None:
         "smart_pruning_factor": 0,
         "dirichlet_noise": False,
         "threads": 1,
+        "minibatch_size": args.minibatch_size,
         "backend": args.backend,
         "wdl_perspective": "side_to_move",
         "wdl_scale": 1000,
@@ -604,6 +614,13 @@ def main() -> None:
     parser.add_argument("--checkpoint-rows", type=int, default=25)
     parser.add_argument("--shard-rows", type=int, default=25_000)
     parser.add_argument("--nncache-size", type=int, default=200_000)
+    parser.add_argument(
+        "--minibatch-size", type=int, default=32,
+        help=(
+            "NN batch size; 32 balances accelerator use and short-search "
+            "quality; 0 uses the backend recommendation"
+        ),
+    )
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument("--lc0-commit", help="override auto-detected lc0 commit")
     parser.add_argument(
@@ -615,6 +632,8 @@ def main() -> None:
     for name in ("nodes", "checkpoint_rows", "shard_rows", "nncache_size"):
         if getattr(args, name) < 1:
             parser.error(f"--{name.replace('_', '-')} must be at least 1")
+    if args.minibatch_size < 0:
+        parser.error("--minibatch-size cannot be negative")
     if args.retries < 0:
         parser.error("--retries cannot be negative")
     try:
