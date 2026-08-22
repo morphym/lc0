@@ -138,15 +138,24 @@ class Progress:
         )
 
 
-def apportion(total: int, counts: dict[str, int]) -> dict[str, int]:
+def stratified_prefix(total: int, counts: dict[str, int]) -> dict[str, int]:
+    """Return monotonic split counts for the first ``total`` virtual rows."""
     denominator = sum(counts.values())
-    raw = {key: total * value / denominator for key, value in counts.items()}
-    result = {key: math.floor(value) for key, value in raw.items()}
-    missing = total - sum(result.values())
-    order = sorted(counts, key=lambda key: (raw[key] - result[key], key), reverse=True)
-    for key in order[:missing]:
-        result[key] += 1
-    return result
+    if not 0 <= total <= denominator:
+        raise ValueError(f"prefix {total} is outside plan size {denominator}")
+    allocated = {split: 0 for split in SPLITS}
+    priorities = {split: -index for index, split in enumerate(SPLITS)}
+    for position in range(total):
+        candidates = [split for split in SPLITS if allocated[split] < counts[split]]
+        chosen = max(
+            candidates,
+            key=lambda split: (
+                (position + 1) * counts[split] - allocated[split] * denominator,
+                priorities[split],
+            ),
+        )
+        allocated[chosen] += 1
+    return allocated
 
 
 def write_json_atomic(path: Path, value: dict[str, object]) -> None:
@@ -179,11 +188,12 @@ def scan_checkpoints(
     output: Path,
     checkpoint_rows: int,
     provenance: dict[bytes, bytes],
+    starts: dict[str, int],
     limits: dict[str, int],
 ) -> dict[str, dict[int, Path]]:
     found: dict[str, dict[int, Path]] = {split: {} for split in SPLITS}
     for split, table in tables.items():
-        for offset in range(0, limits[split], checkpoint_rows):
+        for offset in range(starts[split], limits[split], checkpoint_rows):
             rows = min(checkpoint_rows, limits[split] - offset)
             path = checkpoint_path(output, split, offset, rows)
             if checkpoint_valid(path, rows, provenance):
@@ -195,6 +205,7 @@ def refresh_resume_state(
     state: dict[str, object],
     completed: dict[str, dict[int, Path]],
     tables: dict[str, pa.Table],
+    starts: dict[str, int],
     limits: dict[str, int],
 ) -> None:
     ranges: dict[str, list[dict[str, object]]] = {}
@@ -205,7 +216,7 @@ def refresh_resume_state(
             start, end = checkpoint_bounds(path)
             if start != offset:
                 raise RuntimeError(f"checkpoint offset mismatch: {path}")
-            if start >= limits[split] or end > limits[split]:
+            if start < starts[split] or start >= limits[split] or end > limits[split]:
                 continue
             items.append({"start": start, "end": end, "file": str(path)})
             completed_rows += end - start
@@ -215,7 +226,7 @@ def refresh_resume_state(
 
     next_position: dict[str, object] | None = None
     for split in SPLITS:
-        end = 0
+        end = starts[split]
         for item in ranges[split]:
             if int(item["start"]) != end:
                 break
@@ -595,6 +606,11 @@ def run(args: argparse.Namespace) -> None:
         split: plan.filter(pc.equal(plan["split"], split)) for split in SPLITS
     }
     split_sizes = {split: table.num_rows for split, table in split_tables.items()}
+    if not 0 <= args.start_row < plan.num_rows:
+        raise RuntimeError(
+            f"--start-row must be between 0 and {plan.num_rows - 1}"
+        )
+    available_rows = plan.num_rows - args.start_row
 
     with Lc0PolicyEngine(
         binary, weights, args.backend, args.nncache_size, args.minibatch_size
@@ -627,6 +643,7 @@ def run(args: argparse.Namespace) -> None:
             "adaptive_stop_hours": args.adaptive_stop_hours,
             "adaptive_safety_factor": args.adaptive_safety_factor,
             "adaptive_warmup_rows": args.adaptive_warmup_rows,
+            "start_row": args.start_row,
         }
         provenance_json = {
             key.decode(): value.decode() for key, value in provenance.items()
@@ -645,7 +662,11 @@ def run(args: argparse.Namespace) -> None:
                 raise RuntimeError("unsupported resumability metadata schema")
             if state.get("input_plan_sha256") != plan_hash:
                 raise RuntimeError("resume input plan hash does not match")
-            if state.get("config") != resume_config:
+            previous_config = state.get("config", {})
+            if "start_row" not in previous_config and args.start_row == 0:
+                previous_config["start_row"] = 0
+                state["start_row"] = 0
+            if previous_config != resume_config:
                 raise RuntimeError("resume settings do not match the existing run")
             if state.get("provenance") != provenance_json:
                 raise RuntimeError("resume engine or network provenance does not match")
@@ -656,14 +677,16 @@ def run(args: argparse.Namespace) -> None:
                 "input_plan": str(plan_path),
                 "input_plan_sha256": plan_hash,
                 "plan_rows": plan.num_rows,
+                "start_row": args.start_row,
                 "split_plan_rows": split_sizes,
                 "config": resume_config,
                 "provenance": provenance_json,
                 "adaptive": {
                     "enabled": adaptive_enabled,
                     "measured_positions_per_second": None,
-                    "target_rows": None if adaptive_enabled else plan.num_rows,
+                    "target_rows": None if adaptive_enabled else available_rows,
                     "target_rows_by_split": None,
+                    "end_row": None if adaptive_enabled else plan.num_rows,
                 },
                 "completed_ranges": {split: [] for split in SPLITS},
                 "completed_rows": 0,
@@ -673,27 +696,27 @@ def run(args: argparse.Namespace) -> None:
         adaptive = state["adaptive"]
         target_rows_value = adaptive.get("target_rows")
         target_rows = int(target_rows_value) if target_rows_value is not None else None
-        limits = (
-            apportion(target_rows, split_sizes)
-            if target_rows is not None
-            else dict(split_sizes)
-        )
+        starts = stratified_prefix(args.start_row, split_sizes)
+        end_row = args.start_row + target_rows if target_rows is not None else plan.num_rows
+        limits = stratified_prefix(end_row, split_sizes)
         completed = scan_checkpoints(
-            split_tables, output, args.checkpoint_rows, provenance, limits
+            split_tables, output, args.checkpoint_rows, provenance, starts, limits
         )
         resume_base_rows = sum(
             checkpoint_bounds(path)[1] - checkpoint_bounds(path)[0]
             for paths in completed.values()
             for path in paths.values()
         )
-        progress = Progress(target_rows or plan.num_rows, done=resume_base_rows)
-        refresh_resume_state(state, completed, split_tables, limits)
+        progress = Progress(target_rows or available_rows, done=resume_base_rows)
+        refresh_resume_state(state, completed, split_tables, starts, limits)
         write_json_atomic(resume_path, state)
         print(
             json.dumps(
                 {
-                    "rows": target_rows or plan.num_rows,
+                    "rows": target_rows or available_rows,
                     "plan_rows": plan.num_rows,
+                    "start_row": args.start_row,
+                    "end_row": end_row if target_rows is not None else None,
                     "lc0_version": engine.version,
                     "lc0_commit": commit,
                     "network_sha256": weights_hash,
@@ -710,7 +733,7 @@ def run(args: argparse.Namespace) -> None:
         chunks_by_split: dict[str, list[Path]] = {split: [] for split in SPLITS}
         for split in SPLITS:
             split_table = split_tables[split]
-            offset = 0
+            offset = starts[split]
             while offset < limits[split]:
                 source = split_table.slice(
                     offset, min(args.checkpoint_rows, limits[split] - offset)
@@ -749,17 +772,26 @@ def run(args: argparse.Namespace) -> None:
                             * args.adaptive_safety_factor
                         )
                         target_rows = min(
-                            plan.num_rows,
+                            available_rows,
                             max(progress.done, resume_base_rows + capacity),
                         )
-                        limits = apportion(target_rows, split_sizes)
+                        end_row = args.start_row + target_rows
+                        limits = stratified_prefix(end_row, split_sizes)
                         if limits[split] < offset + source.num_rows:
                             limits[split] = offset + source.num_rows
-                            target_rows = sum(limits.values())
+                            target_rows = sum(
+                                limits[name] - starts[name] for name in SPLITS
+                            )
+                            end_row = args.start_row + target_rows
                         progress.set_total(target_rows)
                         adaptive["measured_positions_per_second"] = progress.rate
                         adaptive["target_rows"] = target_rows
-                        adaptive["target_rows_by_split"] = limits
+                        adaptive["target_rows_by_split"] = {
+                            name: limits[name] - starts[name] for name in SPLITS
+                        }
+                        adaptive["end_row"] = end_row
+                        adaptive["split_start_offsets"] = starts
+                        adaptive["split_end_offsets"] = limits
                         adaptive["warmup_new_rows"] = progress.run_done
                         adaptive["estimated_search_hours"] = (
                             (target_rows - resume_base_rows) / progress.rate / 3600
@@ -771,17 +803,25 @@ def run(args: argparse.Namespace) -> None:
                             flush=True,
                         )
 
-                refresh_resume_state(state, completed, split_tables, limits)
+                refresh_resume_state(
+                    state, completed, split_tables, starts, limits
+                )
                 write_json_atomic(resume_path, state)
                 offset += source.num_rows
 
         if adaptive_enabled and target_rows is None:
             target_rows = progress.done
-            limits = apportion(target_rows, split_sizes)
+            end_row = args.start_row + target_rows
+            limits = stratified_prefix(end_row, split_sizes)
             adaptive["target_rows"] = target_rows
-            adaptive["target_rows_by_split"] = limits
+            adaptive["target_rows_by_split"] = {
+                name: limits[name] - starts[name] for name in SPLITS
+            }
+            adaptive["end_row"] = end_row
+            adaptive["split_start_offsets"] = starts
+            adaptive["split_end_offsets"] = limits
         state["status"] = "finalizing"
-        refresh_resume_state(state, completed, split_tables, limits)
+        refresh_resume_state(state, completed, split_tables, starts, limits)
         write_json_atomic(resume_path, state)
 
         final_metadata = dict(provenance)
@@ -812,7 +852,7 @@ def run(args: argparse.Namespace) -> None:
                 "sha256": sha256(path),
             }
         )
-    expected_rows = target_rows or plan.num_rows
+    expected_rows = target_rows or available_rows
     if total_rows != expected_rows:
         raise RuntimeError(f"final row mismatch: {total_rows} != {expected_rows}")
     manifest = {
@@ -836,6 +876,9 @@ def run(args: argparse.Namespace) -> None:
         "source": args.source_description,
         "split_unit": "source_game_id",
         "input_plan_sha256": plan_hash,
+        "plan_rows": plan.num_rows,
+        "start_row": args.start_row,
+        "end_row": args.start_row + expected_rows,
         "adaptive": state["adaptive"],
         "resumability_metadata": resume_path.name,
         "partitions": partitions,
@@ -870,6 +913,10 @@ def main() -> None:
     )
     parser.add_argument("--retries", type=int, default=1)
     parser.add_argument(
+        "--start-row", type=int, default=0,
+        help="absolute stratified plan row at which this independent run starts",
+    )
+    parser.add_argument(
         "--adaptive-stop-hours",
         type=float,
         help="measure throughput, then cap output rows to this runtime budget",
@@ -901,6 +948,8 @@ def main() -> None:
         parser.error("--minibatch-size cannot be negative")
     if args.retries < 0:
         parser.error("--retries cannot be negative")
+    if args.start_row < 0:
+        parser.error("--start-row cannot be negative")
     if args.adaptive_stop_hours is not None and args.adaptive_stop_hours <= 0:
         parser.error("--adaptive-stop-hours must be positive")
     if args.adaptive_warmup_rows < 1:
