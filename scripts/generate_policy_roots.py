@@ -307,8 +307,11 @@ def parse_search(
     q_values = [edges[move][2] for move in moves]
     v_values = [edges[move][3] for move in moves]
     prior_sum = sum(priors)
-    if not 0.999 <= prior_sum <= 1.001:
-        raise RuntimeError(f"root priors sum to {prior_sum:.9f} for {fen!r}")
+    # VerboseMoveStats exposes the network's raw policy mass. Lc0 masks illegal
+    # actions without renormalizing the remaining legal priors, so their sum can
+    # legitimately be below one (substantially so in unusual positions).
+    if not math.isfinite(prior_sum) or not 0.0 < prior_sum <= 1.001:
+        raise RuntimeError(f"invalid raw root prior sum {prior_sum:.9f} for {fen!r}")
     if sum(visits) > requested_nodes + 8:
         raise RuntimeError(
             f"root visits {sum(visits)} exceed requested nodes {requested_nodes} for {fen!r}"
