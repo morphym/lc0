@@ -36,6 +36,7 @@ MOVE_STATS_RE = re.compile(
     r"\(V:\s*(?P<v>-?[0-9.]+|-\.-+)\)"
 )
 WDL_RE = re.compile(r"\bwdl (\d+) (\d+) (\d+)\b")
+NODES_RE = re.compile(r"\bnodes (\d+)\b")
 CHECKPOINT_RE = re.compile(r"^rows-(\d{9})-(\d{9})\.parquet$")
 CASTLING_UCI = {
     "e1h1": "e1g1",
@@ -337,7 +338,7 @@ class Lc0PolicyEngine:
         self._send("position fen " + fen)
         self._send(f"go nodes {nodes}")
         lines = self._read_until("bestmove")
-        result = parse_search(lines, fen, legal_moves, nodes, self.minibatch_size)
+        result = parse_search(lines, fen, legal_moves, nodes)
         if not self.backend_verified:
             self.require_accelerator()
         return result
@@ -367,17 +368,20 @@ class Lc0PolicyEngine:
 
 
 def parse_search(
-    lines: list[str], fen: str, legal_moves: set[str], requested_nodes: int,
-    minibatch_size: int,
+    lines: list[str], fen: str, legal_moves: set[str], requested_nodes: int
 ) -> dict[str, object]:
     edges: dict[str, tuple[int, float, float, float | None]] = {}
     latest_wdl: tuple[int, int, int] | None = None
+    latest_nodes: int | None = None
     best_move: str | None = None
     for line in lines:
         if not line.startswith("info string "):
             match = WDL_RE.search(line)
             if match:
                 latest_wdl = tuple(map(int, match.groups()))
+            match = NODES_RE.search(line)
+            if match:
+                latest_nodes = int(match.group(1))
         match = MOVE_STATS_RE.match(line)
         if match:
             move = match.group("move")
@@ -419,14 +423,18 @@ def parse_search(
     # legitimately be below one (substantially so in unusual positions).
     if not math.isfinite(prior_sum) or not 0.0 < prior_sum <= 1.001:
         raise RuntimeError(f"invalid raw root prior sum {prior_sum:.9f} for {fen!r}")
-    # Searches stop with an NN batch in flight, so batched inference may exceed
-    # the requested node count by approximately one minibatch.
-    allowed_overshoot = (
-        requested_nodes if minibatch_size == 0 else max(8, minibatch_size)
-    )
-    if sum(visits) > requested_nodes + allowed_overshoot:
+    # Searches stop with multiple NN batches potentially in flight. Their
+    # completion can legitimately overshoot the requested budget, so validate
+    # root visits against Lc0's authoritative final UCI node counter.
+    if latest_nodes is None or latest_nodes < requested_nodes:
         raise RuntimeError(
-            f"root visits {sum(visits)} exceed requested nodes {requested_nodes} for {fen!r}"
+            f"invalid final node count {latest_nodes} for requested "
+            f"{requested_nodes} nodes at {fen!r}"
+        )
+    if sum(visits) > latest_nodes:
+        raise RuntimeError(
+            f"root visits {sum(visits)} exceed final UCI nodes {latest_nodes} "
+            f"for {fen!r}"
         )
     if visits[moves.index(best_move)] != max(visits):
         raise RuntimeError(f"bestmove {best_move!r} lacks maximum visits for {fen!r}")
