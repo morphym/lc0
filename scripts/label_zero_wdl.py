@@ -15,6 +15,7 @@ import os
 import re
 import subprocess
 import sys
+from typing import Sequence
 import threading
 import time
 from pathlib import Path
@@ -264,6 +265,140 @@ class UciWdlEngine:
         self.close()
 
 
+class BatchedLc0Engine:
+    """Evaluate lc0 depth-zero WDL in batches through lc0's Python bindings.
+
+    Over UCI lc0 evaluates one position per round trip, which on a Tesla P100
+    measured 31 positions per second against 74 for the backend at batch 1 and
+    740 at batch 55. Most of batch-1 time is position setup and search-tree
+    initialisation, and the rest is the GPU idling on a batch of one.
+
+    The bindings avoid both. ``GameState.as_input`` calls lc0's own
+    ``EncodePositionForNN`` with ``FillEmptyHistory::FEN_ONLY`` -- the same code
+    the engine uses -- so nothing about the encoding is reimplemented here, and
+    ``Backend.evaluate`` takes as many inputs as it is given.
+
+    Engine identity still comes from a UCI handshake, because the bindings
+    expose no version string and provenance must keep naming the exact build.
+    """
+
+    def __init__(
+        self,
+        binary: Path,
+        weights: Path | None,
+        backend: str | None,
+        uci_options: list[str],
+        name_override: str | None,
+        version_override: str | None,
+        weights_override: str | None,
+        batch_size: int,
+        module_path: str | None,
+    ) -> None:
+        if batch_size < 1:
+            raise ValueError("batch size must be positive")
+        self.kind = "lc0"
+        self.batch_size = batch_size
+        # One short-lived UCI session records exactly which build produced the
+        # labels; the bindings cannot report it.
+        with UciWdlEngine(
+            binary, "lc0", weights, backend, uci_options,
+            name_override, version_override, weights_override,
+        ) as probe:
+            self.name = probe.name
+            self.version = probe.version
+            self.weights_identity = probe.weights_identity
+
+        module = _import_lc0_bindings(module_path)
+        self._weights = module.Weights(str(weights)) if weights else module.Weights()
+        self._backend = module.Backend(weights=self._weights, backend=backend)
+        self._module = module
+
+    def evaluate(self, fen: str) -> tuple[int, int, int]:
+        return self.evaluate_many([fen])[0]
+
+    def evaluate_many(self, fens: Sequence[str]) -> list[tuple[int, int, int]]:
+        results: list[tuple[int, int, int] | None] = [None] * len(fens)
+        pending: list[tuple[int, str]] = []
+        for index, fen in enumerate(fens):
+            terminal = _terminal_wdl(fen)
+            if terminal is None:
+                pending.append((index, fen))
+            else:
+                results[index] = terminal
+        for start in range(0, len(pending), self.batch_size):
+            chunk = pending[start : start + self.batch_size]
+            states = [self._module.GameState(fen=fen) for _, fen in chunk]
+            # as_input returns owned objects; they must outlive the evaluate
+            # call, so the list is held rather than built inline.
+            inputs = [state.as_input(self._backend) for state in states]
+            outputs = self._backend.evaluate(*inputs)
+            if len(outputs) != len(chunk):
+                raise RuntimeError(
+                    f"lc0 returned {len(outputs)} results for {len(chunk)} inputs"
+                )
+            for (index, _), output in zip(chunk, outputs):
+                results[index] = _wdl_from_q_d(output.q(), output.d())
+        if any(result is None for result in results):
+            raise RuntimeError("batched lc0 returned an incomplete WDL batch")
+        return [result for result in results if result is not None]
+
+    def require_accelerator(self) -> None:
+        return None
+
+    def close(self) -> None:
+        return None
+
+    def __enter__(self) -> "BatchedLc0Engine":
+        return self
+
+    def __exit__(self, *_: object) -> None:
+        self.close()
+
+
+def _import_lc0_bindings(module_path: str | None):
+    """Import lc0's ``backends`` module, built with -Dpython_bindings=true."""
+
+    if module_path:
+        sys.path.insert(0, module_path)
+    try:
+        import backends  # type: ignore[import-not-found]
+    except ImportError as error:
+        raise RuntimeError(
+            "lc0 Python bindings not importable. Build lc0 with "
+            "-Dpython_bindings=true and pass --lc0-python-path pointing at the "
+            f"directory holding backends*.so ({error})"
+        ) from error
+    return backends
+
+
+def _terminal_wdl(fen: str) -> tuple[int, int, int] | None:
+    """Exact WDL for a finished game, or None when the engine must evaluate."""
+
+    board = chess.Board(fen)
+    if not board.is_valid():
+        raise RuntimeError(f"invalid chess position: {fen!r}")
+    outcome = board.outcome(claim_draw=True)
+    if outcome is None:
+        return None
+    if outcome.winner is None:
+        return (0, 1000, 0)
+    return (1000, 0, 0) if outcome.winner == board.turn else (0, 0, 1000)
+
+
+def _wdl_from_q_d(q: float, d: float) -> tuple[int, int, int]:
+    """lc0 reports expected score and draw rate; WDL follows from the pair.
+
+    Draw absorbs the rounding residue so the triple sums to 1000 exactly, which
+    is what the UCI layer does.
+    """
+
+    win = int(round((1.0 + q - d) / 2.0 * 1000))
+    loss = int(round((1.0 - q - d) / 2.0 * 1000))
+    win = max(0, min(1000, win))
+    loss = max(0, min(1000 - win, loss))
+    return (win, 1000 - win - loss, loss)
+
+
 def add_wdl(
     table: pa.Table,
     values: list[tuple[int, int, int]],
@@ -301,8 +436,19 @@ def output_is_valid(path: Path, rows: int, metadata: dict[bytes, bytes]) -> bool
 
 
 def evaluate_positions(
-    fens: list[str], engines: list[UciWdlEngine], progress: Progress
+    fens: list[str], engines: list, progress: Progress
 ) -> list[tuple[int, int, int]]:
+    # A batched engine is one object that consumes the whole chunk, so there is
+    # nothing to shard across worker threads.
+    if len(engines) == 1 and isinstance(engines[0], BatchedLc0Engine):
+        engine = engines[0]
+        results = []
+        for start in range(0, len(fens), engine.batch_size):
+            chunk = fens[start : start + engine.batch_size]
+            results.extend(engine.evaluate_many(chunk))
+            progress.advance(len(chunk))
+        return results
+
     results: list[tuple[int, int, int] | None] = [None] * len(fens)
     shards: list[list[tuple[int, str]]] = [[] for _ in engines]
     for index, fen in enumerate(fens):
@@ -460,21 +606,42 @@ def run(args: argparse.Namespace) -> None:
     if weights_identity is None and weights is not None:
         weights_identity = f"{weights.name}@sha256:{weights_hash}"
     with contextlib.ExitStack() as stack:
-        engines = [
-            stack.enter_context(
-                UciWdlEngine(
-                    binary,
-                    args.engine_kind,
-                    weights,
-                    args.backend,
-                    args.uci_option,
-                    args.engine_name,
-                    args.engine_version,
-                    weights_identity,
+        if args.lc0_batch_size and args.engine_kind == "lc0":
+            # Batching replaces process parallelism: one backend saturates the
+            # accelerator far better than several batch-1 processes competing
+            # for it.
+            workers = 1
+            engines = [
+                stack.enter_context(
+                    BatchedLc0Engine(
+                        binary,
+                        weights,
+                        args.backend,
+                        args.uci_option,
+                        args.engine_name,
+                        args.engine_version,
+                        weights_identity,
+                        args.lc0_batch_size,
+                        args.lc0_python_path,
+                    )
                 )
-            )
-            for _ in range(workers)
-        ]
+            ]
+        else:
+            engines = [
+                stack.enter_context(
+                    UciWdlEngine(
+                        binary,
+                        args.engine_kind,
+                        weights,
+                        args.backend,
+                        args.uci_option,
+                        args.engine_name,
+                        args.engine_version,
+                        weights_identity,
+                    )
+                )
+                for _ in range(workers)
+            ]
         identities = {
             (engine.name, engine.version, engine.weights_identity)
             for engine in engines
@@ -630,6 +797,19 @@ def main() -> None:
         help="additional UCI option; repeat for multiple options",
     )
     parser.add_argument(
+        "--lc0-batch-size",
+        type=int,
+        default=0,
+        help="evaluate lc0 in batches of this size through its Python bindings "
+             "instead of one position per UCI round trip; 0 keeps the UCI path. "
+             "Throughput saturates near 55 on a P100 and 64 on Apple metal",
+    )
+    parser.add_argument(
+        "--lc0-python-path",
+        help="directory holding lc0's backends*.so, built with "
+             "-Dpython_bindings=true (default: rely on sys.path)",
+    )
+    parser.add_argument(
         "--workers",
         type=int,
         help="persistent engine processes (default: lc0 cuda=4, otherwise=1)",
@@ -644,6 +824,10 @@ def main() -> None:
         args = parser.parse_args()
         if args.checkpoint_rows < 1:
             parser.error("--checkpoint-rows must be at least 1")
+        if args.lc0_batch_size < 0:
+            parser.error("--lc0-batch-size must not be negative")
+        if args.lc0_batch_size and args.engine_kind != "lc0":
+            parser.error("--lc0-batch-size only applies to --engine-kind lc0")
         run(args)
     except (KeyboardInterrupt, BrokenPipeError):
         print("interrupted; completed position checkpoints are retained", file=sys.stderr)
