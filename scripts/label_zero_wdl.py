@@ -419,14 +419,36 @@ def add_wdl(
     return table.replace_schema_metadata(metadata)
 
 
-def chunk_is_valid(path: Path, rows: int, metadata: dict[bytes, bytes]) -> bool:
+def slice_digest(table: pa.Table) -> bytes:
+    """Identify the rows a chunk covers, not merely how many there are."""
+
+    digest = hashlib.sha256()
+    for value in table.column("fen").to_pylist():
+        digest.update(value.encode())
+        digest.update(b"\0")
+    return digest.hexdigest().encode()
+
+
+def chunk_is_valid(
+    path: Path, rows: int, metadata: dict[bytes, bytes], digest: bytes | None = None
+) -> bool:
     if not path.is_file():
         return False
     parquet = pq.ParquetFile(path)
     actual = parquet.schema_arrow.metadata or {}
-    return parquet.metadata.num_rows == rows and all(
-        actual.get(key) == value for key, value in metadata.items()
-    )
+    if parquet.metadata.num_rows != rows:
+        return False
+    if not all(actual.get(key) == value for key, value in metadata.items()):
+        return False
+    # Row count and source checksum do not pin down which rows a chunk holds:
+    # two slices of one file with the same length look identical to both. A
+    # resume whose row-group or checkpoint boundaries fall differently would
+    # then reuse a chunk whose labels belong to other positions. Chunks written
+    # before this check carry no digest and are rejected, since there is no way
+    # to tell which rows they cover.
+    if digest is not None and actual.get(b"chunk_row_digest") != digest:
+        return False
+    return True
 
 
 def output_is_valid(path: Path, rows: int, metadata: dict[bytes, bytes]) -> bool:
@@ -511,7 +533,7 @@ def label_file(
     for group in range(parquet.num_row_groups):
         table = parquet.read_row_group(group)
         legacy_chunk = work / f"row-group-{group:05d}.parquet"
-        if chunk_is_valid(legacy_chunk, table.num_rows, metadata):
+        if chunk_is_valid(legacy_chunk, table.num_rows, metadata, slice_digest(table)):
             chunks.append(legacy_chunk)
             progress.advance(table.num_rows, report=False)
             continue
@@ -519,12 +541,15 @@ def label_file(
             source_part = table.slice(offset, checkpoint_rows)
             chunk = work / f"row-group-{group:05d}-part-{part:05d}.parquet"
             chunks.append(chunk)
-            if chunk_is_valid(chunk, source_part.num_rows, metadata):
+            digest = slice_digest(source_part)
+            if chunk_is_valid(chunk, source_part.num_rows, metadata, digest):
                 progress.advance(source_part.num_rows, report=False)
                 continue
             fens = source_part.column("fen").to_pylist()
             wdls = evaluate_positions(fens, engines, progress)
-            labeled = add_wdl(source_part, wdls, engine_fields, metadata)
+            chunk_metadata = dict(metadata)
+            chunk_metadata[b"chunk_row_digest"] = digest
+            labeled = add_wdl(source_part, wdls, engine_fields, chunk_metadata)
             temporary = chunk.with_suffix(".tmp")
             pq.write_table(
                 labeled, temporary, compression="zstd", compression_level=6
