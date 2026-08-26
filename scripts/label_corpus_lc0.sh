@@ -35,6 +35,12 @@ BACKEND=${BACKEND:-cuda}
 BATCH=${BATCH:-64}
 CHECKPOINT_ROWS=${CHECKPOINT_ROWS:-25000}
 BUCKET=${BUCKET:-}
+# Names the network in each row. Set it when the weights file has been
+# recompressed: .pb.gz re-gzips to different bytes for identical weights, so
+# the file hash changes while the network does not, and rows would otherwise
+# look like they came from a different net than earlier ones. The file's own
+# hash is still recorded separately as wdl_engine_weights_sha256.
+ENGINE_WEIGHTS=${ENGINE_WEIGHTS:-}
 
 # The datasets to label. Each is a Hive-partitioned directory of positions.
 DATASETS=${DATASETS:-"lc0-selfplay-2m lichess-elite-300k"}
@@ -59,15 +65,27 @@ import backends
 import sysconfig
 print(sysconfig.get_config_var("EXT_SUFFIX"))')"
     echo
-    found=$(find "$(dirname "$LC0")/.." -name 'backends*.so' -o -name 'backends*.pyd' 2>/dev/null | head -5)
-    if [ -n "$found" ]; then
-      echo "Modules that were built:"
+    tag=$("$PYTHON" -c 'import sysconfig;print(sysconfig.get_config_var("EXT_SUFFIX"))')
+    found=$(find "$(dirname "$LC0")/.." "$(dirname "$LC0")" -name 'backends*.so' -o -name 'backends*.pyd' 2>/dev/null | sort -u | head -5)
+    # A module carrying this interpreter's tag is usable, so the path is what
+    # is wrong -- say so rather than offering a rebuild that would change
+    # nothing. LC0_PYTHON_PATH follows $LC0, which is just "." when LC0 is a
+    # bare command name.
+    match=$(echo "$found" | grep -F -- "$tag" | head -1)
+    if [ -n "$match" ]; then
+      echo "A module matching this interpreter already exists:"
+      echo "  $match"
+      echo
+      echo "So the bindings are built correctly and the search path is wrong."
+      echo "Re-run with:"
+      echo "  LC0_PYTHON_PATH=$(cd "$(dirname "$match")" && pwd)"
+    elif [ -n "$found" ]; then
+      echo "Modules that were built, none matching $tag:"
       echo "$found" | sed 's/^/  /'
       echo
-      echo "If the tag above does not match one of these, the bindings were built"
-      echo "against a different Python. Rebuild pointing meson at this one:"
+      echo "The bindings were built against a different Python. Rebuild"
+      echo "pointing meson at this one:"
       echo "  PATH=\"$(dirname "$("$PYTHON" -c 'import sys;print(sys.executable)')"):\$PATH\" ./build.sh -Dpython_bindings=true"
-      echo "Or set LC0_PYTHON_PATH to the directory holding a matching module."
     else
       echo "No backends module near the binary. LC0_PYTHON_PATH defaults to the"
       echo "directory holding \$LC0, so a binary copied out of its build tree"
@@ -98,7 +116,8 @@ for name in $DATASETS; do
     --backend "$BACKEND" \
     --lc0-batch-size "$BATCH" \
     --lc0-python-path "$LC0_PYTHON_PATH" \
-    --checkpoint-rows "$CHECKPOINT_ROWS"
+    --checkpoint-rows "$CHECKPOINT_ROWS" \
+    ${ENGINE_WEIGHTS:+--engine-weights "$ENGINE_WEIGHTS"}
 
   # Mirror each dataset as it finishes rather than at the end, so a session
   # that dies later still leaves the completed ones durable. _work holds
