@@ -273,3 +273,76 @@ be higher, but batch size one reflects request latency.
 If runtime reports `There was an error initializing the GPU device`, ensure
 the process has permission to access Metal. Sandboxed execution environments
 may block GPU device creation even when the binary was compiled correctly.
+
+## Batched evaluation
+
+Over UCI lc0 evaluates one position per round trip. On a Tesla P100 that
+measured 31 positions per second, against 74 for the backend at batch 1 and 740
+at batch 55 in `backendbench`. Most of the batch-1 cost is position setup and
+search-tree initialisation, and the rest is the accelerator idling on a batch
+of one — very little of it is the network.
+
+`--lc0-batch-size` routes evaluation through lc0's Python bindings instead of
+UCI. `GameState.as_input` calls this engine's own `EncodePositionForNN` with
+`FillEmptyHistory::FEN_ONLY`, and `Backend.evaluate` accepts as many inputs as
+it is given, so batching needs no exported graph and reimplements nothing about
+the 112-plane encoding.
+
+Build with the bindings enabled:
+
+```bash
+./build.sh -Dpython_bindings=true
+```
+
+Then label with a batch:
+
+```bash
+python3 scripts/label_zero_wdl.py \
+  --input positions.parquet \
+  --output labeled.parquet \
+  --engine-kind lc0 \
+  --engine build/release/lc0 \
+  --weights /path/to/network.pb.gz \
+  --backend cuda \
+  --lc0-batch-size 64 \
+  --lc0-python-path build/release
+```
+
+`--lc0-batch-size 0` keeps the original UCI path, which remains the default.
+
+Batching sets `workers=1`: one backend saturates the accelerator far better
+than several batch-1 processes competing for it. Engine identity still comes
+from a short UCI handshake, because the bindings expose no version string and
+provenance must keep naming the exact build.
+
+Labels from the batched path were validated against the UCI path over 276
+positions in eight strata: identical engine identity, every row summing to
+1000, and a maximum deviation of 3 in 1000. The residual lives in lc0's UCI
+reporting layer rather than the network — the bindings and an ONNX export of
+the same net agree to five decimals.
+
+### Labeling a whole corpus
+
+`scripts/label_corpus_lc0.sh` drives the labeler over each Hive-partitioned
+dataset in a directory:
+
+```bash
+LC0=build/release/lc0 \
+LC0_WEIGHTS=/path/to/network.pb.gz \
+BACKEND=cuda \
+DATASETS="positions-a positions-b" \
+BUCKET=hf://buckets/user/bucket \
+./scripts/label_corpus_lc0.sh ./corpus ./labeled
+```
+
+It checks the bindings import before touching the corpus, since a build without
+`-Dpython_bindings=true` would otherwise fail only once evaluation was under
+way. `BATCH` defaults to 64, where the P100 figure was measured; the optimum
+depends on the net and the card, and `lc0 backendbench --weights=NET` sweeps it
+in about a minute.
+
+Completed datasets are skipped on their row count and metadata, and partial
+ones resume from the last checkpoint chunk under `_work/` inside the output, so
+re-running after a session dies re-evaluates nothing already paid for. `_work/`
+is scratch: readers ignore underscore-prefixed directories and the mirror step
+excludes it, so partial chunks are never published.
