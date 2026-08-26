@@ -353,7 +353,18 @@ PATH="$(dirname "$(which python3)"):$PATH" ./build.sh -Dpython_bindings=true
 
 The module is built to `build/release/backends.<tag>.so`. `subdir: 'lczero'`
 in `meson.build` affects only where `meson install` places it, not the build
-tree, so `--lc0-python-path build/release` is correct either way. `BATCH` defaults to 64, where the P100 figure was measured; the optimum
+tree, so `--lc0-python-path build/release` is correct either way.
+
+`LC0_PYTHON_PATH` defaults to the directory holding `$LC0`, which is right only
+while the binary sits in its build tree. Copying `lc0` onto a PATH directory —
+a normal thing to do — separates it from the module, and the bindings then have
+to be pointed at explicitly:
+
+```bash
+LC0=/usr/local/bin/lc0 \
+LC0_PYTHON_PATH=/path/to/lc0/build/release \
+./scripts/label_corpus_lc0.sh ./corpus ./labeled
+``` `BATCH` defaults to 64, where the P100 figure was measured; the optimum
 depends on the net and the card, and `lc0 backendbench --weights=NET` sweeps it
 in about a minute.
 

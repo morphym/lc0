@@ -69,9 +69,15 @@ print(sysconfig.get_config_var("EXT_SUFFIX"))')"
       echo "  PATH=\"$(dirname "$("$PYTHON" -c 'import sys;print(sys.executable)')"):\$PATH\" ./build.sh -Dpython_bindings=true"
       echo "Or set LC0_PYTHON_PATH to the directory holding a matching module."
     else
-      echo "No backends module was built. Rebuild with:"
-      echo "  ./build.sh -Dpython_bindings=true"
-      echo "and check that configure reported no error for the Python bindings."
+      echo "No backends module near the binary. LC0_PYTHON_PATH defaults to the"
+      echo "directory holding \$LC0, so a binary copied out of its build tree"
+      echo "leaves it pointing somewhere the module was never installed. Either:"
+      echo
+      echo "  LC0_PYTHON_PATH=/path/to/lc0/build/release  # if it was built"
+      echo "  ./build.sh -Dpython_bindings=true           # if it was not"
+      echo
+      echo "The module is built to build/release/backends.<tag>.so; find it with"
+      echo "  find /path/to/lc0 -name 'backends*.so'"
     fi
   } >&2
   exit 1
