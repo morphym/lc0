@@ -28,6 +28,8 @@ import pyarrow.parquet as pq
 WDL_RE = re.compile(r"\bdepth 0\b.*\bwdl (\d+) (\d+) (\d+)\b")
 ENGINE_MARKER = "zero-wdl"
 WDL_COLUMNS = ("wdl_win", "wdl_draw", "wdl_loss")
+# Backends differ in the last permille; anything larger is not rounding.
+VERIFY_TOLERANCE = 5
 ENGINE_COLUMNS = ("wdl_engine_name", "wdl_engine_version", "wdl_engine_weights")
 
 
@@ -504,6 +506,46 @@ def evaluate_positions(
     return [result for result in results if result is not None]
 
 
+def verify_output(
+    destination: Path, engines: list, sample_rows: int, seed: int
+) -> None:
+    """Re-evaluate a sample of finished rows and insist the labels reproduce.
+
+    Every other check here is structural -- row counts, checksums, triples
+    summing to 1000, a completion flag -- and a backend returning wrong values
+    satisfies all of them. Only asking the engine the same question twice
+    catches that, so a labeled file is not accepted until a sample of it
+    reproduces.
+    """
+
+    import random
+
+    table = pq.read_table(destination, columns=["fen", *WDL_COLUMNS])
+    count = min(sample_rows, table.num_rows)
+    picks = random.Random(seed).sample(range(table.num_rows), count)
+    fens = [table.column("fen")[i].as_py() for i in picks]
+    stored = [
+        tuple(int(table.column(c)[i].as_py()) for c in WDL_COLUMNS) for i in picks
+    ]
+    silent = Progress(count)
+    silent.report = lambda *a, **k: None  # type: ignore[method-assign]
+    again = evaluate_positions(list(fens), engines, silent)
+
+    mismatched = [
+        (f, a, b) for f, a, b in zip(fens, stored, again)
+        if max(abs(x - y) for x, y in zip(a, b)) > VERIFY_TOLERANCE
+    ]
+    if mismatched:
+        f, a, b = mismatched[0]
+        raise RuntimeError(
+            f"{destination}: {len(mismatched)} of {count} sampled rows did not "
+            f"reproduce within {VERIFY_TOLERANCE}/1000. The engine is returning "
+            f"unstable results, so the labels cannot be trusted.\n"
+            f"  first mismatch: {f}\n  stored {a} vs re-evaluated {b}"
+        )
+    print(f"verified {destination}: {count} sampled rows reproduce", flush=True)
+
+
 def label_file(
     source: Path,
     destination: Path,
@@ -513,6 +555,7 @@ def label_file(
     provenance: dict[bytes, bytes],
     progress: Progress,
     checkpoint_rows: int,
+    verify_rows: int = 0,
 ) -> None:
     source_hash = sha256(source)
     metadata = dict(pq.ParquetFile(source).schema_arrow.metadata or {})
@@ -524,6 +567,11 @@ def label_file(
     final_metadata = dict(metadata)
     final_metadata[b"zero_wdl_complete"] = b"true"
     if output_is_valid(destination, rows, final_metadata):
+        # Verify on the skip path too. A file that is structurally complete but
+        # holds wrong labels is exactly what resume would otherwise carry
+        # forward untouched, run after run.
+        if verify_rows:
+            verify_output(destination, engines, verify_rows, seed=rows)
         progress.advance(rows, report=False)
         print(f"skip complete {destination}: {rows:,} rows", flush=True)
         return
@@ -593,6 +641,8 @@ def label_file(
             writer.close()
     if not output_is_valid(destination, rows, final_metadata):
         raise RuntimeError(f"completed output failed validation: {destination}")
+    if verify_rows:
+        verify_output(destination, engines, verify_rows, seed=rows)
     print(f"completed {destination}: {rows:,} rows", flush=True)
 
 
@@ -729,6 +779,7 @@ def run(args: argparse.Namespace) -> None:
                 provenance,
                 progress,
                 args.checkpoint_rows,
+                args.verify_rows,
             )
 
     partitions = []
@@ -844,6 +895,13 @@ def main() -> None:
         type=int,
         default=1000,
         help="positions per atomic resume checkpoint (default: 1000)",
+    )
+    parser.add_argument(
+        "--verify-rows",
+        type=int,
+        default=256,
+        help="after each file, re-evaluate this many random labeled rows and "
+             "fail if they do not reproduce; 0 disables the check",
     )
     try:
         args = parser.parse_args()

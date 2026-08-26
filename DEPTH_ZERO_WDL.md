@@ -373,3 +373,21 @@ ones resume from the last checkpoint chunk under `_work/` inside the output, so
 re-running after a session dies re-evaluates nothing already paid for. `_work/`
 is scratch: readers ignore underscore-prefixed directories and the mirror step
 excludes it, so partial chunks are never published.
+
+### Verification
+
+Every other check on a labeled file is structural: row counts, checksums,
+triples summing to 1000, a completion flag. A backend returning wrong values
+satisfies all of them, so `--verify-rows` (256 by default) re-evaluates a
+random sample of finished rows and refuses the file unless they reproduce
+within 5 in 1000. It runs on skipped files as well as newly written ones,
+because a structurally complete file holding wrong labels is precisely what a
+resume would otherwise carry forward untouched.
+
+This is not hypothetical. Labeling 2.3M positions twice on a Tesla P100 through
+the CUDA backend produced runs that agreed with each other on only half the
+rows, differing by as much as the full 1000, from identical inputs and
+identical recorded provenance -- same engine binary checksum, same network
+checksum, same backend. The same labeler on Apple metal reproduces its own
+output exactly, and matches direct backend evaluation on every sampled row.
+Nothing structural distinguished the bad output from the good one.
