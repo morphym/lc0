@@ -335,9 +335,25 @@ BUCKET=hf://buckets/user/bucket \
 ./scripts/label_corpus_lc0.sh ./corpus ./labeled
 ```
 
-It checks the bindings import before touching the corpus, since a build without
-`-Dpython_bindings=true` would otherwise fail only once evaluation was under
-way. `BATCH` defaults to 64, where the P100 figure was measured; the optimum
+It checks the bindings import before touching the corpus, since the run would
+otherwise fail only once evaluation was under way. On failure it prints the
+real import error, the running interpreter and the extension-module tag it
+loads, and any `backends*.so` it can find.
+
+A missing `-Dpython_bindings=true` is only one cause. Meson resolves the
+bindings target through `find_installation('python3')`, which need not be the
+interpreter that runs the labeler — and an extension module is importable only
+by the Python whose ABI tag it carries, so a module built against
+`python3.10` is invisible to `python3.11` even sitting in the same directory.
+On a machine with several interpreters, put the intended one first:
+
+```bash
+PATH="$(dirname "$(which python3)"):$PATH" ./build.sh -Dpython_bindings=true
+```
+
+The module is built to `build/release/backends.<tag>.so`. `subdir: 'lczero'`
+in `meson.build` affects only where `meson install` places it, not the build
+tree, so `--lc0-python-path build/release` is correct either way. `BATCH` defaults to 64, where the P100 figure was measured; the optimum
 depends on the net and the card, and `lc0 backendbench --weights=NET` sweeps it
 in about a minute.
 

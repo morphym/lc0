@@ -39,16 +39,43 @@ BUCKET=${BUCKET:-}
 # The datasets to label. Each is a Hive-partitioned directory of positions.
 DATASETS=${DATASETS:-"lc0-selfplay-2m lichess-elite-300k"}
 
-# A build without -Dpython_bindings=true is the likely setup mistake, and it
-# would otherwise surface only after the first chunk was already evaluated.
-"$PYTHON" -c "
-import sys; sys.path.insert(0, '$LC0_PYTHON_PATH')
+# Check the bindings before touching the corpus: without them the run would
+# fail only after the first chunk was already evaluated. Report why the import
+# failed rather than assuming, since a missing build flag is only one cause --
+# meson's find_installation('python3') may also have built the module against a
+# different interpreter than the one running this script, and an extension
+# module is only importable by the Python whose ABI tag it carries.
+if ! bindings_error=$("$PYTHON" -c "
+import sys
+sys.path.insert(0, '$LC0_PYTHON_PATH')
 import backends
-" 2>/dev/null || {
-  echo "No lc0 Python bindings importable from $LC0_PYTHON_PATH." >&2
-  echo "Rebuild lc0 with: ./build.sh -Dpython_bindings=true" >&2
+" 2>&1); then
+  {
+    echo "Cannot import lc0's backends module from $LC0_PYTHON_PATH:"
+    echo "$bindings_error" | sed 's/^/  /'
+    echo
+    echo "This interpreter is $("$PYTHON" -c 'import sys;print(sys.executable)')"
+    echo "and loads extension modules tagged $("$PYTHON" -c '
+import sysconfig
+print(sysconfig.get_config_var("EXT_SUFFIX"))')"
+    echo
+    found=$(find "$(dirname "$LC0")/.." -name 'backends*.so' -o -name 'backends*.pyd' 2>/dev/null | head -5)
+    if [ -n "$found" ]; then
+      echo "Modules that were built:"
+      echo "$found" | sed 's/^/  /'
+      echo
+      echo "If the tag above does not match one of these, the bindings were built"
+      echo "against a different Python. Rebuild pointing meson at this one:"
+      echo "  PATH=\"$(dirname "$("$PYTHON" -c 'import sys;print(sys.executable)')"):\$PATH\" ./build.sh -Dpython_bindings=true"
+      echo "Or set LC0_PYTHON_PATH to the directory holding a matching module."
+    else
+      echo "No backends module was built. Rebuild with:"
+      echo "  ./build.sh -Dpython_bindings=true"
+      echo "and check that configure reported no error for the Python bindings."
+    fi
+  } >&2
   exit 1
-}
+fi
 
 for name in $DATASETS; do
   source_dir=$corpus/$name.parquet
