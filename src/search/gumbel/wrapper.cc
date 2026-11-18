@@ -3,6 +3,7 @@
 
 #include <algorithm>
 #include <atomic>
+#include <bit>
 #include <chrono>
 #include <cmath>
 #include <condition_variable>
@@ -25,6 +26,8 @@ namespace lczero {
 namespace {
 const OptionId kSimulations{"gumbel-simulations", "GumbelSimulations",
     "Simulation budget when go nodes is absent."};
+const OptionId kBatchSize{"gumbel-batch-size", "GumbelBatchSize",
+    "Maximum simultaneous leaf evaluations; 0 uses backend recommendation (up to 64), 1 is serial."};
 const OptionId kConsidered{"gumbel-considered", "GumbelConsideredMoves",
     "Maximum root candidates for sequential halving."};
 const OptionId kCVisit{"gumbel-c-visit", "GumbelCVisit", "Q visit-scale offset."};
@@ -83,38 +86,81 @@ class GumbelSearch final : public SearchBase {
     return history_.GetLength() == root_length_ ? root_moves_ :
         history_.Last().GetBoard().GenerateLegalMoves();
   }
+  // Legal moves are generated once on expansion and stored as tokens on C
+  // edges. Replaying a path no longer regenerates legal moves at every ply.
+  int Prepare(gaz_evaluation* result) {
+    eval_moves_ = Moves();
+    const auto& pos = history_.Last();
+    const auto& board = pos.GetBoard();
+    result->count = 0;
+    if (eval_moves_.empty()) {
+      result->value = board.IsUnderCheck() ? -1 : 0;
+      result->draw = board.IsUnderCheck() ? 0 : 1;
+      return 0;
+    }
+    if (!board.HasMatingMaterial() || pos.GetRule50Ply() >= 100 || pos.GetRepetitions() >= 2) {
+      result->value = 0;
+      result->draw = 1;
+      return 0;
+    }
+    if (eval_moves_.size() > GAZ_MAX_ACTIONS) throw Exception("Too many legal moves");
+    result->count = static_cast<int>(eval_moves_.size());
+    for (int i = 0; i < result->count; ++i) result->actions[i] = eval_moves_[i].raw_data();
+    return result->count;
+  }
   static int Evaluate(void* context, float* value, float* draw, float* p) noexcept {
     auto& self = *static_cast<GumbelSearch*>(context);
     try {
-      const auto result = self.history_.ComputeGameResult();
-      if (result != GameResult::UNDECIDED) {
-        if (result == GameResult::DRAW) { *value = 0; *draw = 1; }
-        else {
-          *draw = 0;
-          const bool black_won = result == GameResult::BLACK_WON;
-          *value = black_won == self.history_.IsBlackToMove() ? 1 : -1;
+      gaz_evaluation result;
+      const int count = self.Prepare(&result);
+      if (count) {
+        auto computation = self.backend_->CreateComputation();
+        const auto status = computation->AddInput(
+            {self.history_.GetPositions(), self.eval_moves_},
+            {.q = &result.value, .d = &result.draw,
+             .p = std::span(result.probabilities, count)});
+        if (status == BackendComputation::ENQUEUED_FOR_EVAL) {
+          computation->ComputeBlocking();
+          ++self.network_evaluations_;
         }
-        return 0;
+        std::copy_n(result.probabilities, count, p);
       }
-      const MoveList moves = self.Moves();
-      if (moves.empty()) { *value = 0; *draw = 1; return 0; }
-      if (moves.size() > GAZ_MAX_ACTIONS) throw Exception("Too many legal moves");
-      const EvalPosition pos{self.history_.GetPositions(), moves};
-      auto results = self.backend_->EvaluateBatch(std::span(&pos, 1));
-      if (results.size() != 1 || results[0].p.size() != moves.size())
-        throw Exception("Invalid Gumbel backend policy size");
-      *value = results[0].q;
-      *draw = results[0].d;
-      std::copy(results[0].p.begin(), results[0].p.end(), p);
-      return static_cast<int>(moves.size());
+      *value = result.value;
+      *draw = result.draw;
+      return count;
     } catch (...) { self.error_ = std::current_exception(); return -1; }
   }
-  static int Push(void* context, int action) noexcept {
+  static int Enqueue(void* context, gaz_evaluation* result) noexcept {
     auto& self = *static_cast<GumbelSearch*>(context);
     try {
-      const auto moves = self.Moves();
-      if (action < 0 || action >= static_cast<int>(moves.size())) return 0;
-      self.history_.Append(moves[action]);
+      const int count = self.Prepare(result);
+      if (!count) return 1;
+      if (!self.computation_) self.computation_ = self.backend_->CreateComputation();
+      const auto status = self.computation_->AddInput(
+          {self.history_.GetPositions(), self.eval_moves_},
+          {.q = &result->value, .d = &result->draw,
+           .p = std::span(result->probabilities, count)});
+      if (status == BackendComputation::ENQUEUED_FOR_EVAL) ++self.queued_evaluations_;
+      return 1;
+    } catch (...) { self.error_ = std::current_exception(); return 0; }
+  }
+  static int Flush(void* context) noexcept {
+    auto& self = *static_cast<GumbelSearch*>(context);
+    try {
+      if (self.queued_evaluations_) {
+        self.computation_->ComputeBlocking();
+        self.network_evaluations_ += self.queued_evaluations_;
+      }
+      return 1;
+    } catch (...) { self.error_ = std::current_exception(); return 0; }
+  }
+  static int ActionToken(void* context, int action) {
+    return static_cast<GumbelSearch*>(context)->eval_moves_[action].raw_data();
+  }
+  static int Push(void* context, int token) noexcept {
+    auto& self = *static_cast<GumbelSearch*>(context);
+    try {
+      self.history_.Append(std::bit_cast<Move>(static_cast<uint16_t>(token)));
       return 1;
     } catch (...) { self.error_ = std::current_exception(); return 0; }
   }
@@ -184,7 +230,10 @@ class GumbelSearch final : public SearchBase {
       const float d = std::clamp(gaz_action_draw(tree, a), 0.0f, 1 - std::abs(q));
       const int w = std::lround(500 * (1 + q - d)), l = std::lround(500 * (1 - q - d));
       infos.push_back({.depth = gaz_depth(tree), .seldepth = gaz_depth(tree),
-          .time = elapsed, .nodes = nodes, .nps = nps, .score = Score(q, d),
+          .time = elapsed, .nodes = nodes, .nps = nps,
+          .eps = static_cast<int>(std::min<int64_t>(std::numeric_limits<int>::max(),
+              network_evaluations_ * 1000 / std::max<int64_t>(1, elapsed))),
+          .score = Score(q, d),
           .wdl = ThinkingInfo::WDL{w, 1000 - w - l, l},
           .pv = PrincipalVariation(tree, a), .multipv = rank + 1});
     }
@@ -229,8 +278,15 @@ class GumbelSearch final : public SearchBase {
       }
       if (!root_moves_.empty()) best = root_moves_.front();
       error_ = nullptr;
+      network_evaluations_ = 0;
+      computation_.reset();
+      const auto attrs = backend_->GetAttributes();
+      const int requested_batch = options_->Get<int>(kBatchSize);
+      const int auto_batch = attrs.runs_on_cpu ? 1 : std::clamp(attrs.recommended_batch_size, 1, 64);
+      const int batch_size = std::clamp(requested_batch ? requested_batch : auto_batch,
+          1, std::clamp(attrs.maximum_batch_size, 1, GAZ_MAX_ACTIONS));
       std::unique_ptr<gaz_search, decltype(&gaz_destroy)> tree(
-          gaz_create(&cfg, {this, Evaluate, Push, Pop}), gaz_destroy);
+          gaz_create(&cfg, {this, Evaluate, Push, Pop, ActionToken}), gaz_destroy);
       if (!tree) {
         if (error_) std::rethrow_exception(error_);
         throw Exception("Cannot initialize Gumbel search");
@@ -255,7 +311,12 @@ class GumbelSearch final : public SearchBase {
       int round_budget = std::max(1, cfg.simulations);
       auto next_report = Clock::now();
       while (!stop_ && Clock::now() < deadline) {
-        const int status = gaz_step(tree.get());
+        queued_evaluations_ = 0;
+        const int status = batch_size == 1 ? gaz_step(tree.get()) :
+            gaz_step_batch(tree.get(), batch_size, {this, Enqueue, Flush});
+        // All result pointers belong to C batch scratch; release the backend
+        // computation before that scratch can be reused, including on error.
+        computation_.reset();
         if (status < 0) {
           if (error_) std::rethrow_exception(error_);
           throw Exception("Gumbel simulation failed");
@@ -291,7 +352,10 @@ class GumbelSearch final : public SearchBase {
   const OptionsDict* options_;
   GameState state_;
   PositionHistory history_;
-  MoveList root_moves_;
+  MoveList root_moves_, eval_moves_;
+  std::unique_ptr<BackendComputation> computation_;
+  int queued_evaluations_ = 0;
+  int64_t network_evaluations_ = 0;
   int root_length_ = 0;
   std::exception_ptr error_;
   Clock::time_point clock_start_{};
@@ -313,6 +377,7 @@ class GumbelSearchFactory final : public SearchFactory {
         "win_percentage", "Q", "W-L", "WDL_mu"}) = "WDL_mu";
     options->Add<FloatOption>(kSmartPruning, 0, 10) = 0;
     options->Add<IntOption>(kSimulations, 1, 1000000000) = 1024;
+    options->Add<IntOption>(kBatchSize, 0, GAZ_MAX_ACTIONS) = 0;
     options->Add<IntOption>(kConsidered, 1, GAZ_MAX_ACTIONS) = 16;
     options->Add<FloatOption>(kCVisit, 0, 10000) = 50;
     options->Add<FloatOption>(kCScale, 0, 100) = 0.1f;

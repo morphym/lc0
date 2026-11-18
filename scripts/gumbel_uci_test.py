@@ -9,7 +9,7 @@ import time
 
 engine = subprocess.Popen(
     [sys.argv[1], '--backend=random', '--weights=',
-     '--gumbel-noise=0', '--gumbel-simulations=64'],
+     '--gumbel-noise=0', '--gumbel-simulations=64', *sys.argv[2:]],
     stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL,
     text=True, bufsize=1)
 lines = queue.Queue()
@@ -133,7 +133,8 @@ finally:
     if engine.poll() is None:
         send('quit')
         try:
-            engine.wait(timeout=5)
+            code = engine.wait(timeout=5)
+            assert code == 0, f'Engine exited with status {code}'
         except subprocess.TimeoutExpired:
             engine.kill()
             raise

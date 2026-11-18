@@ -8,7 +8,7 @@
 typedef struct node node;
 typedef struct {
   double prior, log_prior, sum, draw_sum;
-  int visits;
+  int visits, in_flight, pending, action;
   node* child;
 } edge;
 struct node {
@@ -16,10 +16,19 @@ struct node {
   int count;
   edge* edges;
 };
+typedef struct {
+  edge* path[GAZ_MAX_DEPTH];
+  int depth;
+  edge* leaf_edge;
+  node* expansion;
+  gaz_evaluation evaluation;
+} pending_leaf;
 struct gaz_search {
   gaz_config cfg;
   gaz_callbacks cb;
   node* root;
+  pending_leaf* batch;
+  int batch_capacity;
   double noise[GAZ_MAX_ACTIONS];
   int round_visits[GAZ_MAX_ACTIONS];
   int done, depth, round_budget;
@@ -33,9 +42,8 @@ static void free_node(node* n) {
   free(n);
 }
 
-static node* expand(gaz_callbacks cb) {
-  float p[GAZ_MAX_ACTIONS], value, draw;
-  int count = cb.evaluate(cb.context, &value, &draw, p);
+static node* make_node(int count, float value, float draw, const float* p,
+                       const int* actions) {
   if (count < 0 || count > GAZ_MAX_ACTIONS || !isfinite(value) ||
       value < -1.0f || value > 1.0f || !isfinite(draw) || draw < 0 ||
       draw > 1.0f) return NULL;
@@ -51,6 +59,7 @@ static node* expand(gaz_callbacks cb) {
   for (int i = 0; i < count; ++i) {
     if (!isfinite(p[i]) || p[i] < 0) { free_node(n); return NULL; }
     /* Retain finite log priors for probabilities underflowed by a backend. */
+    n->edges[i].action = actions ? actions[i] : i;
     n->edges[i].prior = fmax(p[i], FLT_MIN);
     sum += n->edges[i].prior;
   }
@@ -59,6 +68,16 @@ static node* expand(gaz_callbacks cb) {
     n->edges[i].log_prior = log(n->edges[i].prior);
   }
   return n;
+}
+
+static node* expand(gaz_callbacks cb) {
+  float p[GAZ_MAX_ACTIONS], value, draw;
+  int actions[GAZ_MAX_ACTIONS];
+  const int count = cb.evaluate(cb.context, &value, &draw, p);
+  if (count < 0 || count > GAZ_MAX_ACTIONS) return NULL;
+  for (int i = 0; i < count; ++i)
+    actions[i] = cb.action_token ? cb.action_token(cb.context, i) : i;
+  return make_node(count, value, draw, p, actions);
 }
 
 /* SplitMix64; midpoint conversion keeps U strictly in (0,1). */
@@ -115,19 +134,19 @@ static int root_select(const gaz_search* s, int visit) {
   for (int i = 0; i < s->root->count; ++i) {
     const edge* e = &s->root->edges[i];
     double score = s->noise[i] + e->log_prior + q[i];
-    if (s->round_visits[i] == visit && score > best) { best = score; action = i; }
+    if (!e->pending && s->round_visits[i] == visit && score > best) { best = score; action = i; }
   }
   return action;
 }
 
 static int interior_select(const gaz_search* s, const node* n) {
   double p[GAZ_MAX_ACTIONS], total = 1, best = -DBL_MAX;
-  int action = 0;
+  int action = -1;
   policy(s, n, p);
-  for (int i = 0; i < n->count; ++i) total += n->edges[i].visits;
+  for (int i = 0; i < n->count; ++i) total += n->edges[i].visits + n->edges[i].in_flight;
   for (int i = 0; i < n->count; ++i) {
-    double score = p[i] - n->edges[i].visits / total;
-    if (score > best) { best = score; action = i; }
+    double score = p[i] - (n->edges[i].visits + n->edges[i].in_flight) / total;
+    if (!n->edges[i].pending && score > best) { best = score; action = i; }
   }
   return action;
 }
@@ -173,6 +192,20 @@ gaz_search* gaz_create(const gaz_config* cfg, gaz_callbacks cb) {
   return s;
 }
 
+static void advance_schedule(gaz_search* s) {
+  if (++s->in_cycle == s->considered) {
+    s->in_cycle = 0;
+    ++s->considered_visit;
+    if (++s->cycles == s->extra && s->considered > 1) {
+      s->cycles = 0;
+      s->considered /= 2;
+      if (s->considered < 2) s->considered = 2;
+      s->extra = s->round_budget / (s->log2max * s->considered);
+      if (s->extra < 1) s->extra = 1;
+    }
+  }
+}
+
 int gaz_step(gaz_search* s) {
   if (!s || !s->root->count || s->done >= s->cfg.simulations) return 0;
   edge* path[GAZ_MAX_DEPTH];
@@ -180,7 +213,7 @@ int gaz_step(gaz_search* s) {
   int depth = 0, failed = 0;
   while (n->count && depth < s->cfg.max_depth) {
     int a = depth ? interior_select(s, n) : root_select(s, s->considered_visit);
-    if (a < 0 || !s->cb.push(s->cb.context, a)) { failed = 1; break; }
+    if (a < 0 || !s->cb.push(s->cb.context, n->edges[a].action)) { failed = 1; break; }
     edge* e = &n->edges[a];
     path[depth++] = e;
     if (!e->child) {
@@ -203,21 +236,103 @@ int gaz_step(gaz_search* s) {
   }
   if (failed) return -1;
   ++s->done;
-  if (++s->in_cycle == s->considered) {
-    s->in_cycle = 0;
-    ++s->considered_visit;
-    if (++s->cycles == s->extra && s->considered > 1) {
-      s->cycles = 0;
-      s->considered /= 2;
-      if (s->considered < 2) s->considered = 2;
-      s->extra = s->round_budget / (s->log2max * s->considered);
-      if (s->extra < 1) s->extra = 1;
-    }
-  }
+  advance_schedule(s);
   return 1;
 }
 
-void gaz_destroy(gaz_search* s) { if (s) { free_node(s->root); free(s); } }
+int gaz_step_batch(gaz_search* s, int max_batch, gaz_batch_callbacks cb) {
+  if (!s || max_batch < 1 || !cb.enqueue || !cb.flush) return -1;
+  if (max_batch == 1) return gaz_step(s);
+  if (!s->root->count || s->done >= s->cfg.simulations) return 0;
+  if (max_batch > GAZ_MAX_ACTIONS) max_batch = GAZ_MAX_ACTIONS;
+  if (max_batch > s->cfg.simulations - s->done)
+    max_batch = s->cfg.simulations - s->done;
+  /* Complete all reservations before eliminating any root candidates. */
+  if (s->considered > 2) {
+    const int phase_left = (s->extra - s->cycles) * s->considered - s->in_cycle;
+    if (max_batch > phase_left) max_batch = phase_left;
+  }
+  if (s->batch_capacity < max_batch) {
+    pending_leaf* batch = (pending_leaf*)realloc(s->batch, (size_t)max_batch * sizeof(*batch));
+    if (!batch) return -1;
+    s->batch = batch;
+    s->batch_capacity = max_batch;
+  }
+  const gaz_search saved = *s;
+  int count = 0, failed = 0, enqueued = 0;
+  while (count < max_batch) {
+    pending_leaf* r = &s->batch[count];
+    r->depth = 0;
+    r->leaf_edge = NULL;
+    r->expansion = NULL;
+    node* n = s->root;
+    int collision = 0;
+    while (n->count && r->depth < s->cfg.max_depth) {
+      const int a = r->depth ? interior_select(s, n) : root_select(s, s->considered_visit);
+      if (a < 0) { collision = 1; break; }
+      edge* e = &n->edges[a];
+      if (!s->cb.push(s->cb.context, e->action)) { failed = 1; break; }
+      r->path[r->depth++] = e;
+      ++e->in_flight;
+      if (!e->child) {
+        r->leaf_edge = e;
+        e->pending = 1;
+        r->evaluation.count = -1;
+        for (int i = 0; i < GAZ_MAX_ACTIONS; ++i) r->evaluation.actions[i] = i;
+        if (!cb.enqueue(cb.context, &r->evaluation)) failed = 1;
+        else ++enqueued;
+        break;
+      }
+      n = e->child;
+    }
+    for (int i = 0; i < r->depth; ++i) s->cb.pop(s->cb.context);
+    if (failed || collision) {
+      for (int i = 0; i < r->depth; ++i) --r->path[i]->in_flight;
+      if (r->leaf_edge) r->leaf_edge->pending = 0;
+      break;
+    }
+    if (!r->leaf_edge) {
+      r->evaluation.value = n->value;
+      r->evaluation.draw = n->draw;
+    }
+    ++s->round_visits[r->path[0] - s->root->edges];
+    advance_schedule(s);
+    ++count;
+  }
+  if (!failed && enqueued && !cb.flush(cb.context)) failed = 1;
+  if (!failed) {
+    /* Validate and allocate every expansion before committing any result. */
+    for (int i = 0; i < count; ++i) {
+      pending_leaf* r = &s->batch[i];
+      if (!r->leaf_edge) continue;
+      const gaz_evaluation* v = &r->evaluation;
+      r->expansion = make_node(v->count, v->value, v->draw, v->probabilities, v->actions);
+      if (!r->expansion) { failed = 1; break; }
+    }
+  }
+  for (int i = 0; i < count; ++i) {
+    pending_leaf* r = &s->batch[i];
+    if (r->leaf_edge) {
+      r->leaf_edge->pending = 0;
+      if (!failed) r->leaf_edge->child = r->expansion;
+      else free_node(r->expansion);
+    }
+    double value = failed ? 0 : (r->leaf_edge ? r->expansion->value : r->evaluation.value);
+    const double draw = failed ? 0 : (r->leaf_edge ? r->expansion->draw : r->evaluation.draw);
+    for (int j = r->depth; j > 0; --j) {
+      edge* e = r->path[j - 1];
+      --e->in_flight;
+      value = -value;
+      if (!failed) { ++e->visits; e->sum += value; e->draw_sum += draw; }
+    }
+    if (!failed && r->depth > s->depth) s->depth = r->depth;
+  }
+  if (failed) { *s = saved; return -1; }
+  s->done += count;
+  return count;
+}
+
+void gaz_destroy(gaz_search* s) { if (s) { free_node(s->root); free(s->batch); free(s); } }
 int gaz_best_action(const gaz_search* s) {
   if (!s || !s->root->count) return -1;
   int maxvisit = 0;

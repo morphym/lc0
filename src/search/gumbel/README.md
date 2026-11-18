@@ -50,6 +50,7 @@ and the scheduling/completion conventions of
 | UCI option | Default | Meaning |
 | --- | --- | --- |
 | GumbelSimulations | 1024 | Finite budget, or initial round for continuing analysis |
+| GumbelBatchSize | 0 | Automatic GPU batching (up to 64); 1 selects serial evaluation |
 | GumbelConsideredMoves | 16 | Maximum initial root candidates |
 | GumbelCVisit | 50 | Visit offset in Q transform |
 | GumbelCScale | 0.1 | Q transform scale |
@@ -72,6 +73,49 @@ Verbose rows use Nibbler's lc0 format and finish with a `node` summary.
 `U` is zero because this search has no PUCT bonus; `S` is the improved-policy
 probability. The strongest move is the last verbose row, as Nibbler expects.
 Draw probabilities are backed up with Q rather than estimated from Q alone.
+
+## GPU batching and throughput
+
+GPU backends now evaluate several reserved leaves per computation. Automatic
+batch sizing (`GumbelBatchSize=0`) uses the backend recommendation up to 64 and
+its maximum supported batch size; CPU backends default to one. An explicit
+`--gumbel-batch-size=32` (or UCI `GumbelBatchSize`) selects a different ceiling,
+up to 256. This is a batch-size ceiling, not a simulation or nodes/sec limit.
+Actual batches may be smaller because of pending-leaf collisions, halving
+boundaries, terminal positions, or the remaining simulation budget.
+
+The C core tracks in-flight visits for deterministic interior selection and
+prevents duplicate expansion of a pending edge. It flushes evaluations before
+eliminating root candidates. A failed enqueue, computation, or invalid result
+rolls back the whole batch's reservations and root schedule. Completed visits
+and WDL backups are committed only after all batch results validate. Requests
+are bounded by the remaining `go nodes` budget. Legal moves are generated once
+at expansion and stored as move tokens on tree edges, avoiding regeneration on
+every traversal. Cache hits do not launch empty neural computations. UCI EPS
+reports uncached neural evaluations separately from simulation NPS.
+
+As in other batched tree searches, selecting several leaves before receiving
+their values can change the trajectory and final move at a fixed budget.
+`GumbelBatchSize=1` preserves the serial search. Playing strength has not been
+benchmarked; the optimization measures throughput and tests search invariants.
+
+Compare batch sizes on the target Linux CUDA machine after building:
+
+```sh
+python3 scripts/gumbel_benchmark.py ./build/cuda/lc0 \
+  --backend=cuda-auto --weights=/path/to/network.pb.gz \
+  --nodes=1024 --batches=1,8,32,64 --repeats=3
+```
+
+The benchmark warms up the backend and clears the evaluation cache before each
+measured search. On the development Mac's Metal backend, using
+`BT3-768x15x24h-swa-2790000.pb`, 128 simulations from startpos, and two measured
+runs per configuration, median search times were 3017.5 ms at batch 1 and
+1727 ms at batch 32 (approximately 1.75x throughput). Linux CUDA throughput
+must be measured on the target GPU. A separate synthetic random-backend test
+with a 2 ms per-computation delay, 512 simulations, and three measured runs
+produced 1300/168/48/31 ms for batches 1/8/32/64; those figures isolate call
+overhead and are not real GPU performance measurements.
 
 ## Linux CUDA build
 
@@ -106,7 +150,7 @@ position evaluation and push/pop. `wrapper.cc` bridges lc0's C++ board, neural
 backend, options, and UCI lifecycle. Tree values alternate sign at every ply;
 terminal positions use lc0's mate, stalemate, material, repetition and fifty-move
 adjudication. Trees are rebuilt for each search. This initial implementation is
-single-worker, one evaluation at a time, with a maximum traversal depth of 256;
+single tree worker with batched neural evaluation and a maximum traversal depth of 256;
 it does not probe Syzygy or generate training artifacts. It makes no strength or
 GPU throughput claim relative to lc0's batched classic search.
 

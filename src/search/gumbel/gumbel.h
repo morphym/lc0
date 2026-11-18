@@ -17,6 +17,9 @@ typedef struct {
   int (*evaluate)(void*, float* value, float* draw, float* probabilities);
   int (*push)(void*, int action);
   void (*pop)(void*);
+  /* Optional: translate a legal-action index into a caller move token while
+     the just-evaluated position is current. push receives that token. */
+  int (*action_token)(void*, int action);
 } gaz_callbacks;
 typedef struct {
   int simulations;
@@ -26,6 +29,24 @@ typedef struct {
   uint64_t seed;
 } gaz_config;
 typedef struct gaz_search gaz_search;
+typedef struct {
+  int count;
+  float value, draw;
+  float probabilities[GAZ_MAX_ACTIONS];
+  int actions[GAZ_MAX_ACTIONS];
+} gaz_evaluation;
+typedef struct {
+  void* context;
+  /* Called at the selected leaf, before pop. Fill count/actions immediately;
+     value/draw/probabilities may be filled by flush. Return 0 on failure. */
+  int (*enqueue)(void*, gaz_evaluation*);
+  int (*flush)(void*);
+} gaz_batch_callbacks;
+/* Reserve distinct leaves and evaluate them together. Never crosses a root
+   halving boundary with unresolved values. Returns simulations completed,
+   zero at budget exhaustion/terminal root, or -1 on error. Batch=1 matches
+   gaz_step exactly. Failed batches undo reservations and schedule changes. */
+int gaz_step_batch(gaz_search*, int max_batch, gaz_batch_callbacks);
 /* create evaluates the root. NULL means invalid configuration/evaluation/OOM. */
 gaz_search* gaz_create(const gaz_config*, gaz_callbacks);
 void gaz_destroy(gaz_search*);
