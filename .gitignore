@@ -19,3 +19,4 @@ xcuserdata
 compile_flags.txt
 .vscode
 .mesonpy*
+/work/

@@ -283,7 +283,9 @@ void StringUciResponder::SendId() {
 
 void StringUciResponder::OutputBestMove(BestMoveInfo* info) {
   const bool c960 = IsChess960();
-  std::string res = "bestmove " + info->bestmove.ToString(c960);
+  std::string res = "bestmove " +
+      (info->bestmove.is_null() ? std::string("0000")
+                                : info->bestmove.ToString(c960));
   if (!info->ponder.is_null()) res += " ponder " + info->ponder.ToString(c960);
   if (info->player != -1) res += " player " + std::to_string(info->player);
   if (info->game_id != -1) res += " gameid " + std::to_string(info->game_id);

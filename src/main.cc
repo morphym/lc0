@@ -71,8 +71,8 @@ void ChooseAndRunEngine() {
     }
   }
 
-  // Finally, run "classic" search through the new API.
-  RunEngine(SearchManager::Get()->GetFactoryByName("classic"));
+  // Finally, run Gumbel AlphaZero search through the new API.
+  RunEngine(SearchManager::Get()->GetFactoryByName("gumbel"));
 }
 }  // namespace lczero
 

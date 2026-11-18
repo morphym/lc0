@@ -14,8 +14,8 @@
 # You should have received a copy of the GNU General Public License
 # along with Leela Chess.  If not, see <http://www.gnu.org/licenses/>.
 
-project('lc0', 'cpp',
-        default_options : ['cpp_std=c++20', 'b_ndebug=if-release', 'warning_level=3', 'b_lto=true', 'b_vscrt=mt'],
+project('lc0', 'c', 'cpp',
+        default_options : ['c_std=c11', 'cpp_std=c++20', 'b_ndebug=if-release', 'warning_level=3', 'b_lto=true', 'b_vscrt=mt'],
         meson_version: '>=0.60')
 
 fs = import('fs')
@@ -203,6 +203,8 @@ files += [
 
 files += [
   'src/search/instamove/instamove.cc',
+  'src/search/gumbel/gumbel.c',
+  'src/search/gumbel/wrapper.cc',
 ]
 
 includes += include_directories('src')
@@ -936,7 +938,7 @@ configure_file(output : 'default_backend.h',
 
 if get_option('lc0')
   files += common_files
-  executable('lc0', 'src/main.cc',
+  lc0_exe = executable('lc0', 'src/main.cc',
        files, include_directories: includes, dependencies: deps, install: true)
 endif
 
@@ -1028,4 +1030,15 @@ if get_option('python_bindings')
     dependencies: [cpython] + deps,
     subdir: 'lczero',
     install: true)
+endif
+
+# Standalone C algorithm tests do not require gtest or a network.
+gumbel_math = meson.get_compiler('c').find_library('m', required: false)
+test('GumbelSearch', executable('gumbel_test',
+  ['src/search/gumbel/gumbel_test.c', 'src/search/gumbel/gumbel.c'],
+  include_directories: includes, dependencies: gumbel_math))
+
+if get_option('lc0')
+  test('GumbelUci', find_program('python3'),
+    args: [files('scripts/gumbel_uci_test.py'), lc0_exe], timeout: 45)
 endif
